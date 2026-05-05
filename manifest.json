@@ -1,0 +1,58 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/mcpb-manifest.schema.json",
+  "manifest_version": "0.4",
+
+  "name": "apple-reminders",
+  "display_name": "Apple Reminders",
+  "version": "0.1.0",
+  "description": "Access Apple Reminders on macOS via EventKit — search, create, update, complete, and delete reminders with full support for subtasks, recurrence, alarms, and locations.",
+  "long_description": "Connects Claude to Apple Reminders on your Mac via Apple's first-class EventKit framework. Full read+write coverage of the Reminders data model.\n\n**Features:**\n- Browse all reminder lists across all accounts (iCloud, Local, CalDAV, Exchange)\n- Search reminders by free text, list, completion, due date, priority\n- Create reminders with notes, URL, due/start dates, priority, and #hashtag tags\n- Recurrence rules — daily/weekly/monthly/yearly, with intervals, by-day/by-month, end date or count\n- Alarms — relative offset, absolute date, or location-based geofence (enter/leave)\n- Subtasks — create child reminders, list children, cascade delete\n- Mark reminders complete or uncomplete\n- Manage reminder lists themselves — create, rename, recolor, delete\n- Deep-link any reminder via x-apple-reminderkit:// URL\n\n**Requirements:**\n- macOS 14 Sonoma or later\n- Reminders permission (System Settings → Privacy & Security → Reminders)",
+
+  "author": {
+    "name": "Brad"
+  },
+
+  "icon": "icon.png",
+  "icons": [
+    { "src": "icons/icon-128.png", "size": "128x128" },
+    { "src": "icons/icon-256.png", "size": "256x256" },
+    { "src": "icons/icon-512.png", "size": "512x512" }
+  ],
+
+  "server": {
+    "type": "uv",
+    "entry_point": "src/apple_reminders_mcp/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--project", "${__dirname}", "apple-reminders-mcp"],
+      "env": {}
+    }
+  },
+
+  "tools": [
+    { "name": "list_reminder_lists",   "description": "List every reminder list (calendar) on this Mac, with id, title, color, source, and write-access flag" },
+    { "name": "create_reminder_list",  "description": "Create a new reminder list with optional color and source/account" },
+    { "name": "update_reminder_list",  "description": "Rename or recolor an existing reminder list" },
+    { "name": "delete_reminder_list",  "description": "Delete a reminder list and all its reminders (destructive)" },
+    { "name": "get_stats",             "description": "Aggregate counts: list count, total reminders, incomplete, completed, overdue, due today" },
+    { "name": "list_reminders",        "description": "List reminders in one or more lists, with filters: completed, priority, due_before/after, has_subtasks, text" },
+    { "name": "search_reminders",      "description": "Free-text search across reminder titles and notes, with filters for list, completion, priority, and due date" },
+    { "name": "get_reminder",          "description": "Full detail for a reminder — notes, URL, recurrence, alarms, location, subtask ids, tags, timestamps" },
+    { "name": "get_reminder_link",     "description": "Get an x-apple-reminderkit:// URL that opens the reminder in Reminders.app" },
+    { "name": "list_subtasks",         "description": "List the immediate subtasks (child reminders) of a parent reminder" },
+    { "name": "create_reminder",       "description": "Create a reminder with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks)" },
+    { "name": "update_reminder",       "description": "Update any subset of a reminder's properties; explicit clear_* flags remove fields" },
+    { "name": "complete_reminder",     "description": "Mark a reminder as complete or uncomplete (or toggle if completed is null)" },
+    { "name": "delete_reminder",       "description": "Delete a reminder; cascades to subtasks by default" }
+  ],
+
+  "keywords": ["apple", "reminders", "tasks", "todo", "macos", "subtasks", "recurrence", "geofence", "eventkit"],
+  "license": "MIT",
+
+  "compatibility": {
+    "platforms": ["darwin"],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  }
+}
