@@ -31,3 +31,6 @@ kangentic.json
 
 # Plan files
 plans/
+
+# Dev-only tooling (icon extraction) — not part of the extension
+tools/
