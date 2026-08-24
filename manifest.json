@@ -4,7 +4,7 @@
 
   "name": "apple-reminders",
   "display_name": "Apple Reminders",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Access Apple Reminders on macOS via EventKit — search, create, update, complete, and delete reminders with full support for subtasks, recurrence, alarms, and locations.",
   "long_description": "Connects Claude to Apple Reminders on your Mac via Apple's first-class EventKit framework. Full read+write coverage of the Reminders data model.\n\n**Features:**\n- Browse all reminder lists across all accounts (iCloud, Local, CalDAV, Exchange)\n- Search reminders by free text, list, completion, due date, priority\n- Create reminders with notes, URL, due/start dates, priority, and #hashtag tags\n- Recurrence rules — daily/weekly/monthly/yearly, with intervals, by-day/by-month, end date or count\n- Alarms — relative offset, absolute date, or location-based geofence (enter/leave)\n- Subtasks — create child reminders, list children, cascade delete\n- Mark reminders complete or uncomplete\n- Manage reminder lists themselves — create, rename, recolor, delete\n- Deep-link any reminder via x-apple-reminderkit:// URL\n\n**Requirements:**\n- macOS 14 Sonoma or later\n- Reminders permission (System Settings → Privacy & Security → Reminders)",
 
