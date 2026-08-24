@@ -43,8 +43,9 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
+from . import __version__
 from .models import (
     AlarmSpec,
     DeleteResult,
@@ -82,10 +83,10 @@ _store = None  # type: ignore[var-annotated]
 
 
 # ---------------------------------------------------------------------------
-# FastMCP app
+# MCP server app
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
+mcp = MCPServer(
     "Apple Reminders",
     instructions=(
         "Access to Apple Reminders on this Mac via EventKit. "
@@ -93,6 +94,7 @@ mcp = FastMCP(
         "complete, and delete reminders; and work with subtasks, "
         "recurrence, alarms, and locations."
     ),
+    version=__version__,
 )
 
 

@@ -148,7 +148,7 @@ apple-reminders-mcp/
 └── src/
     └── apple_reminders_mcp/
         ├── __init__.py
-        ├── server.py                # MCP tools (FastMCP)
+        ├── server.py                # MCP tools (MCPServer)
         ├── reminders.py             # EventKit-backed RemindersStore
         ├── permissions.py           # TCC grant helpers
         └── models.py                # Pydantic data models
