@@ -1,6 +1,6 @@
 [project]
 name = "apple-reminders-mcp"
-version = "0.1.2"
+version = "0.2.0"
 description = "MCP server for Apple Reminders on macOS via EventKit"
 readme = "README.md"
 requires-python = ">=3.11"

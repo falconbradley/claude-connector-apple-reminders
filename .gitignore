@@ -33,3 +33,6 @@ Thumbs.db
 .kangentic/
 .claude/settings.local.json
 kangentic.local.json
+
+# pytest
+.pytest_cache/

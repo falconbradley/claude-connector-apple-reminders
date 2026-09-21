@@ -34,3 +34,9 @@ plans/
 
 # Dev-only tooling (icon extraction) — not part of the extension
 tools/
+
+# Dev-only: test suites and their pytest cache. They cannot run from the
+# installed bundle anyway — the permissioned tier needs Claude Desktop to be
+# the responsible process, not a shell in this directory.
+tests/
+.pytest_cache/
