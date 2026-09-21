@@ -221,6 +221,11 @@ def _hex_to_cgcolor(hex_str: str) -> Optional[Any]:
         return None
 
 
+def _source_names(sources: Iterable[Any]) -> str:
+    names = [str(s.title()) for s in sources]
+    return ", ".join(repr(n) for n in names) if names else "none"
+
+
 def _calendar_to_model(cal: Any) -> ReminderList:
     src = cal.source()
     return ReminderList(
@@ -465,6 +470,87 @@ class RemindersStore:
             raise ValueError(f"Reminder list not found: {list_id}")
         return cal
 
+    def _reminder_sources(self) -> list[Any]:
+        """Sources that can actually host reminder lists, best first.
+
+        EventKit exposes no "does this source support reminders?" flag, and
+        source *type* is not a proxy for it: a Google or Exchange account
+        shows up as calDAV alongside iCloud but serves calendars only, so
+        saving a reminder list into it fails with "That account does not
+        support reminders."  The observable signal is whether the source
+        already vends calendars for ``EKEntityTypeReminder``.
+
+        The source behind ``defaultCalendarForNewReminders()`` is the one
+        Reminders.app itself writes to, so it leads the list.
+        """
+        ranked: list[Any] = []
+        seen: set[str] = set()
+
+        def add(src: Any) -> None:
+            if src is None:
+                return
+            key = str(src.sourceIdentifier())
+            if key in seen:
+                return
+            seen.add(key)
+            ranked.append(src)
+
+        try:
+            default_cal = self._store.defaultCalendarForNewReminders()
+        except Exception:  # pragma: no cover - defensive
+            default_cal = None
+        if default_cal is not None:
+            add(default_cal.source())
+
+        capable = []
+        for src in self._store.sources() or []:
+            cals = src.calendarsForEntityType_(EKEntityTypeReminder) or []
+            if len(cals):
+                capable.append(src)
+        # Among the rest, keep the historical iCloud-before-local preference.
+        preferred_order = (
+            EKSourceTypeCalDAV,
+            EKSourceTypeMobileMe,
+            EKSourceTypeLocal,
+            EKSourceTypeExchange,
+        )
+        for st in preferred_order:
+            for src in capable:
+                if src.sourceType() == st:
+                    add(src)
+        for src in capable:
+            add(src)
+        return ranked
+
+    def _choose_list_source(self, source_name: Optional[str]) -> Any:
+        """Pick the source a new reminder list should be saved into."""
+        candidates = self._reminder_sources()
+        if source_name:
+            wanted = source_name.strip().lower()
+            for src in candidates:
+                if str(src.title()).lower() == wanted:
+                    return src
+            # Named a source that exists but cannot hold reminders.
+            for src in self._store.sources() or []:
+                if str(src.title()).lower() == wanted:
+                    raise ValueError(
+                        f"Source {source_name!r} does not support reminders. "
+                        f"Available: {_source_names(candidates)}"
+                    )
+            raise ValueError(
+                f"Unknown source: {source_name!r}. "
+                f"Available: {_source_names(candidates)}"
+            )
+        if candidates:
+            return candidates[0]
+        # No source vends reminder calendars yet (a machine with none at
+        # all); fall back to any writable source rather than refusing.
+        for st in (EKSourceTypeCalDAV, EKSourceTypeMobileMe, EKSourceTypeLocal):
+            for src in self._store.sources() or []:
+                if src.sourceType() == st:
+                    return src
+        raise RuntimeError("No source available for new reminder list.")
+
     def create_list(
         self,
         title: str,
@@ -476,25 +562,7 @@ class RemindersStore:
         cal = EKCalendar.calendarForEntityType_eventStore_(EKEntityTypeReminder, self._store)
         cal.setTitle_(title.strip())
 
-        # Choose a source: explicit by name, or first writable Reminders source.
-        chosen = None
-        for src in self._store.sources():
-            if source_name and source_name.lower() == str(src.title()).lower():
-                chosen = src
-                break
-        if chosen is None:
-            # Prefer iCloud / CalDAV; fall back to Local.
-            preferred_order = (EKSourceTypeCalDAV, EKSourceTypeMobileMe, EKSourceTypeLocal)
-            for st in preferred_order:
-                for src in self._store.sources():
-                    if src.sourceType() == st:
-                        chosen = src
-                        break
-                if chosen is not None:
-                    break
-        if chosen is None:
-            raise RuntimeError("No source available for new reminder list.")
-        cal.setSource_(chosen)
+        cal.setSource_(self._choose_list_source(source_name))
 
         if color:
             cgc = _hex_to_cgcolor(color)

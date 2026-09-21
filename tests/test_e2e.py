@@ -282,6 +282,139 @@ def t_predicate_selectors_exist():
             )
 
 
+class _FakeSource:
+    """Stand-in for EKSource: a title, a type, and its reminder calendars."""
+
+    def __init__(self, ident, title, source_type, reminder_calendars=0):
+        self._ident = ident
+        self._title = title
+        self._type = source_type
+        self._cals = [object()] * reminder_calendars
+
+    def sourceIdentifier(self):
+        return self._ident
+
+    def title(self):
+        return self._title
+
+    def sourceType(self):
+        return self._type
+
+    def calendarsForEntityType_(self, entity_type):
+        return self._cals
+
+
+class _FakeCalendar:
+    def __init__(self, source):
+        self._source = source
+
+    def source(self):
+        return self._source
+
+
+class _FakeEventStore:
+    def __init__(self, sources, default_source=None):
+        self._sources = sources
+        self._default = _FakeCalendar(default_source) if default_source else None
+
+    def sources(self):
+        return self._sources
+
+    def defaultCalendarForNewReminders(self):
+        return self._default
+
+
+def _store_with(sources, default_source=None):
+    """A RemindersStore wired to a fake EKEventStore, with no TCC prompt."""
+    from apple_reminders_mcp.reminders import RemindersStore
+
+    store = object.__new__(RemindersStore)
+    store._store = _FakeEventStore(sources, default_source)
+    store._access_granted = True
+    return store
+
+
+def _brads_sources():
+    """The topology that broke create_reminder_list on 2026-09-21.
+
+    Two calDAV accounts: iCloud, which holds all six reminder lists, and a
+    calendar-only account that sorts ahead of it. The old code picked the
+    first calDAV source it saw and EventKit rejected the save with "That
+    account does not support reminders."
+    """
+    from EventKit import EKSourceTypeCalDAV, EKSourceTypeLocal
+
+    calendar_only = _FakeSource("s1", "Work Calendar", EKSourceTypeCalDAV, 0)
+    icloud = _FakeSource("s2", "iCloud", EKSourceTypeCalDAV, 6)
+    local = _FakeSource("s3", "On My Mac", EKSourceTypeLocal, 0)
+    return calendar_only, icloud, local
+
+
+@test("A", "new-list source skips accounts that cannot hold reminders")
+def t_list_source_skips_incapable():
+    calendar_only, icloud, local = _brads_sources()
+    store = _store_with([calendar_only, icloud, local])
+
+    chosen = store._choose_list_source(None)
+    eq(str(chosen.title()), "iCloud", "must not pick the calendar-only calDAV account")
+
+    # Ordering must not rescue it: reversing the list still lands on iCloud.
+    store = _store_with([local, icloud, calendar_only])
+    eq(str(store._choose_list_source(None).title()), "iCloud")
+
+
+@test("A", "new-list source follows the default reminders list")
+def t_list_source_prefers_default():
+    calendar_only, icloud, local = _brads_sources()
+    local_with_lists = _FakeSource("s3", "On My Mac", local.sourceType(), 2)
+    # Both are capable; the account Reminders.app itself writes to wins,
+    # even though calDAV outranks local by type.
+    store = _store_with(
+        [calendar_only, icloud, local_with_lists], default_source=local_with_lists
+    )
+    eq(str(store._choose_list_source(None).title()), "On My Mac")
+
+
+@test("A", "explicit source name is validated against reminder support")
+def t_list_source_explicit_name():
+    calendar_only, icloud, local = _brads_sources()
+    store = _store_with([calendar_only, icloud, local])
+
+    eq(str(store._choose_list_source("iCloud").title()), "iCloud")
+    eq(str(store._choose_list_source("  icloud ").title()), "iCloud", "case/space insensitive")
+
+    # Naming the calendar-only account fails in Python with a message that
+    # names the usable sources, rather than in EventKit with "That account
+    # does not support reminders."
+    try:
+        store._choose_list_source("Work Calendar")
+    except ValueError as exc:
+        truthy("does not support reminders" in str(exc))
+        truthy("'iCloud'" in str(exc), "error should list the usable sources")
+    else:
+        raise AssertionError("expected ValueError for a calendar-only source")
+
+    try:
+        store._choose_list_source("Nope")
+    except ValueError as exc:
+        truthy("Unknown source" in str(exc))
+    else:
+        raise AssertionError("expected ValueError for an unknown source")
+
+
+@test("A", "new-list source falls back when no list exists yet")
+def t_list_source_fallback():
+    from EventKit import EKSourceTypeCalDAV, EKSourceTypeLocal
+
+    # A machine with no reminder lists at all: nothing vends reminder
+    # calendars, so capability cannot be observed. Still pick something
+    # writable rather than refusing outright.
+    icloud = _FakeSource("s1", "iCloud", EKSourceTypeCalDAV, 0)
+    local = _FakeSource("s2", "On My Mac", EKSourceTypeLocal, 0)
+    store = _store_with([local, icloud])
+    eq(str(store._choose_list_source(None).title()), "iCloud")
+
+
 # ---------------------------------------------------------------------------
 # Group B — Live EventKit
 # ---------------------------------------------------------------------------
