@@ -578,9 +578,10 @@ class RemindersStore:
     ) -> Any:
         # Apple EventKit offers three prebuilt predicate factories:
         #   predicateForIncompleteRemindersWithDueDateStarting:ending:calendars:
-        #   predicateForCompleteRemindersWithCompletionDateStarting:ending:calendars:
+        #   predicateForCompletedRemindersWithCompletionDateStarting:ending:calendars:
         #   predicateForRemindersInCalendars:
         # Pick whichever fits and apply post-filtering for anything beyond.
+        # Note the asymmetry in Apple's naming: "Incomplete" but "Completed".
         starting = _datetime_to_ns_date(due_after) if due_after else None
         ending = _datetime_to_ns_date(due_before) if due_before else None
 
@@ -589,9 +590,12 @@ class RemindersStore:
                 starting, ending, lists,
             )
         if completed is True:
-            # `completed` predicate uses completion date, not due date — still useful.
-            return self._store.predicateForCompleteRemindersWithCompletionDateStarting_ending_calendars_(
-                starting, ending, lists,
+            # This predicate bounds by *completion* date, but due_after/due_before
+            # are due-date bounds — passing them here would silently drop items
+            # completed outside the window. Fetch all completed rows and let
+            # _post_filter apply the due-date filter.
+            return self._store.predicateForCompletedRemindersWithCompletionDateStarting_ending_calendars_(
+                None, None, lists,
             )
         return self._store.predicateForRemindersInCalendars_(lists)
 

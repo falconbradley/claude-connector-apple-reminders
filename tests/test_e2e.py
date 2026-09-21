@@ -245,6 +245,43 @@ def t_iso_parse():
         raise AssertionError("_parse_iso should reject malformed input")
 
 
+@test("A", "EventKit predicate selectors exist")
+def t_predicate_selectors_exist():
+    """Guard against typos in the Objective-C selectors we call by name.
+
+    PyObjC resolves selectors lazily, so a misspelled one only blows up when
+    the matching code path is exercised against a live store. Assert up front
+    that every selector _build_predicate reaches for is really there — note
+    Apple's asymmetry: "Incomplete" but "Completed".
+    """
+    try:
+        import EventKit  # noqa: F401
+    except ImportError as exc:
+        skip(f"PyObjC/EventKit not available: {exc}")
+
+    for selector in (
+        "predicateForIncompleteRemindersWithDueDateStarting_ending_calendars_",
+        "predicateForCompletedRemindersWithCompletionDateStarting_ending_calendars_",
+        "predicateForRemindersInCalendars_",
+        "fetchRemindersMatchingPredicate_completion_",
+    ):
+        truthy(
+            hasattr(EventKit.EKEventStore, selector),
+            f"EKEventStore has no selector {selector}",
+        )
+
+    # And that the module actually calls those names, not lookalikes.
+    from pathlib import Path as _Path
+    src = (_Path(__file__).resolve().parent.parent
+           / "src" / "apple_reminders_mcp" / "reminders.py").read_text()
+    for bad in ("predicateForCompleteRemindersWith", "predicateForCompleteReminders:"):
+        if bad in src:
+            raise AssertionError(
+                f"reminders.py references non-existent selector prefix {bad!r} "
+                "— the real one is predicateForCompletedReminders..."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Group B — Live EventKit
 # ---------------------------------------------------------------------------
@@ -252,25 +289,38 @@ def t_iso_parse():
 TEST_LIST_TITLE = "__claude_mcp_test__"
 
 _store = None
+_store_skip_reason: Optional[str] = None
 _test_list_id: Optional[str] = None
 _created_reminder_ids: list[str] = []
 
 
 def _store_or_skip():
-    global _store
+    """Return the shared RemindersStore, or skip.
+
+    The failure reason is cached: EventKit refuses to hand out more than a
+    handful of EKEventStore instances per process ("too many EKEventStore
+    instances"), so retrying the constructor once per test both wastes the
+    quota and buries the real first error.
+    """
+    global _store, _store_skip_reason
     if _store is not None:
         return _store
+    if _store_skip_reason is not None:
+        skip(_store_skip_reason)
     try:
         from apple_reminders_mcp.permissions import PermissionDeniedError
         from apple_reminders_mcp.reminders import RemindersStore
     except ImportError as exc:
-        skip(f"PyObjC/EventKit not available: {exc}")
+        _store_skip_reason = f"PyObjC/EventKit not available: {exc}"
+        skip(_store_skip_reason)
     try:
         _store = RemindersStore()
     except PermissionDeniedError as exc:
-        skip(f"Reminders access not granted: {exc}")
+        _store_skip_reason = f"Reminders access not granted: {exc}"
+        skip(_store_skip_reason)
     except Exception as exc:
-        skip(f"Could not init RemindersStore: {exc}")
+        _store_skip_reason = f"Could not init RemindersStore: {exc}"
+        skip(_store_skip_reason)
     return _store
 
 
@@ -463,6 +513,109 @@ def t_reminder_link_live():
     _track(detail.id)
     link = store.get_reminder_link(detail.id)
     is_in("x-apple-reminderkit://REMCDReminder/", link)
+
+
+@test("B", "completed filter sweep (list + search)")
+def t_completed_filter_sweep():
+    """Exercise every `completed` value against a real store.
+
+    Regression guard for the crash where completed=True hit a misspelled
+    EventKit selector: completed=False and completed=None took different
+    predicate branches and passed, so the bug only surfaced here.
+    """
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+
+    marker = "zzsweep"
+    open_item = store.create_reminder(title=f"{marker} still open", list_id=list_id)
+    _track(open_item.id)
+    done_item = store.create_reminder(title=f"{marker} already done", list_id=list_id)
+    _track(done_item.id)
+    store.complete_reminder(done_item.id, completed=True)
+
+    def ids(rows):
+        return {r.id for r in rows}
+
+    # --- list_reminders ---------------------------------------------------
+    _, rows = store.list_reminders(list_ids=[list_id], completed=True, limit=200)
+    got = ids(rows)
+    is_in(done_item.id, got, "completed=True must return the completed reminder")
+    truthy(open_item.id not in got, "completed=True must not return open reminders")
+    truthy(all(r.completed for r in rows), "completed=True returned an open row")
+
+    _, rows = store.list_reminders(list_ids=[list_id], completed=False, limit=200)
+    got = ids(rows)
+    is_in(open_item.id, got, "completed=False must return the open reminder")
+    truthy(done_item.id not in got, "completed=False must not return completed reminders")
+    truthy(not any(r.completed for r in rows), "completed=False returned a completed row")
+
+    _, rows = store.list_reminders(list_ids=[list_id], completed=None, limit=200)
+    got = ids(rows)
+    is_in(open_item.id, got, "completed=None must return open reminders")
+    is_in(done_item.id, got, "completed=None must return completed reminders")
+
+    # --- search_reminders (same parameter, shared code path) --------------
+    _, rows = store.search_reminders(
+        query=marker, list_ids=[list_id], completed=True, limit=200
+    )
+    got = ids(rows)
+    is_in(done_item.id, got, "search completed=True must return the completed reminder")
+    truthy(open_item.id not in got, "search completed=True must not return open reminders")
+
+    _, rows = store.search_reminders(
+        query=marker, list_ids=[list_id], completed=False, limit=200
+    )
+    got = ids(rows)
+    is_in(open_item.id, got, "search completed=False must return the open reminder")
+    truthy(done_item.id not in got, "search completed=False must not return completed reminders")
+
+    _, rows = store.search_reminders(
+        query=marker, list_ids=[list_id], completed=None, limit=200
+    )
+    got = ids(rows)
+    is_in(open_item.id, got, "search completed=None must return open reminders")
+    is_in(done_item.id, got, "search completed=None must return completed reminders")
+
+
+@test("B", "completed filter combined with due-date bounds")
+def t_completed_with_due_bounds():
+    """completed=True + due_before/due_after must filter by DUE date.
+
+    The EventKit predicate for completed reminders bounds by *completion*
+    date; feeding due-date bounds into it would silently drop rows completed
+    outside the window. The item below is completed now but due in the past,
+    so it must survive a past due window and vanish from a future one.
+    """
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+
+    past_due = (datetime.now().astimezone() - timedelta(days=3)).replace(
+        microsecond=0, second=0
+    )
+    item = store.create_reminder(
+        title="zzbounds overdue but finished", list_id=list_id, due_date=past_due
+    )
+    _track(item.id)
+    store.complete_reminder(item.id, completed=True)
+
+    _, rows = store.list_reminders(
+        list_ids=[list_id],
+        completed=True,
+        due_before=past_due + timedelta(days=1),
+        limit=200,
+    )
+    is_in(item.id, {r.id for r in rows}, "due_before window should include the item")
+
+    _, rows = store.list_reminders(
+        list_ids=[list_id],
+        completed=True,
+        due_after=datetime.now().astimezone() + timedelta(days=1),
+        limit=200,
+    )
+    truthy(
+        item.id not in {r.id for r in rows},
+        "due_after window in the future should exclude a past-due item",
+    )
 
 
 # ---------------------------------------------------------------------------
