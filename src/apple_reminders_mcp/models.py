@@ -93,7 +93,18 @@ class ReminderDetail(ReminderSummary):
     alarms: list[AlarmSpec] = []
     location: Optional[LocationSpec] = None
     subtask_ids: list[str] = []
-    tags: list[str] = []                      # parsed #hashtags from title + notes
+    # Real Apple Reminders tags — the ones shown as chips in Reminders.app
+    # and filterable in its sidebar. EventKit cannot see these; they are
+    # read from the app's own store (see tagstore.py). None (rather than
+    # []) means "could not be read", which is NOT the same as "no tags" —
+    # see tags_unavailable_reason.
+    tags: Optional[list[str]] = None
+    tags_unavailable_reason: Optional[str] = None
+    # `#tokens` scraped out of the title and notes text. These are NOT
+    # Apple tags and never were: writing "#foo" into a title tags nothing.
+    # Kept because some callers key off text conventions of their own, but
+    # named so it can never be mistaken for the real thing.
+    text_hashtags: list[str] = []
     creation_date: Optional[datetime] = None
     modification_date: Optional[datetime] = None
 
@@ -101,6 +112,13 @@ class ReminderDetail(ReminderSummary):
 # ---------------------------------------------------------------------------
 # Result envelopes
 # ---------------------------------------------------------------------------
+
+class TagInfo(BaseModel):
+    """A real Apple Reminders tag, with its usage across all accounts."""
+    name: str                                 # as the user typed it, no leading "#"
+    reminder_count: int = 0
+    reminder_ids: list[str] = []
+
 
 class SearchResult(BaseModel):
     total: int

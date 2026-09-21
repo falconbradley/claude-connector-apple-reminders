@@ -4,8 +4,14 @@ End-to-end tests for the Apple Reminders MCP connector.
 Tests are split into two groups:
 
   Group A — Static tests (no Reminders permission required)
-    Pydantic model shapes, input validation, hashtag parsing.
+    Pydantic model shapes, input validation, hashtag parsing, and the
+    tag-store reader against a synthetic fixture store.
     Always run.
+
+  Group C — Live local Reminders store (requires Full Disk Access)
+    Reads the real Reminders Core Data store to check real-tag reading
+    and the real-tag / text-hashtag split. Needs no Reminders TCC grant,
+    only file access. Skipped with a clear message when unreadable.
 
   Group B — Live EventKit tests (requires Reminders access)
     Operate against a dedicated test list named ``__claude_mcp_test__``,
@@ -59,7 +65,7 @@ def skip(msg: str):
 
 def run_all(skip_live: bool = False) -> None:
     for group, name, fn in _registry:
-        if skip_live and group == "B":
+        if skip_live and group in ("B", "C"):
             _results.append((_SKIP, group, name, "live tests skipped"))
             continue
         try:
@@ -125,7 +131,12 @@ def t_model_shapes():
     eq(rs.is_all_day, False)
 
     rd = ReminderDetail(**rs.model_dump())
-    eq(rd.tags, [])
+    # `tags` defaults to None, NOT []. None means "real tags could not be
+    # read"; [] means "this reminder genuinely has none". Collapsing the
+    # two is what let a fabricated tag list pass for authoritative.
+    eq(rd.tags, None)
+    eq(rd.tags_unavailable_reason, None)
+    eq(rd.text_hashtags, [])
     eq(rd.alarms, [])
 
     stats = RemindersStats(list_count=1, total=2, incomplete=2, completed=0, overdue=0, due_today=1)
@@ -195,17 +206,110 @@ def t_alarm_validation():
         raise AssertionError("AlarmSpec should reject unknown proximity")
 
 
-@test("A", "hashtag parsing")
+@test("A", "text hashtag scraping")
 def t_hashtag_parsing():
-    from apple_reminders_mcp.reminders import _extract_tags
+    """The text scraper, which finds text and nothing more.
 
-    eq(_extract_tags(None), [])
-    eq(_extract_tags(""), [])
-    eq(_extract_tags("Buy milk"), [])
-    eq(_extract_tags("Buy milk #shopping"), ["shopping"])
-    eq(_extract_tags("#Work meeting #urgent #q2-plan"), ["Work", "urgent", "q2-plan"])
+    Renamed from _extract_tags deliberately: it never read Apple tags,
+    and the old name is what made its output look authoritative.
+    """
+    from apple_reminders_mcp.reminders import _extract_text_hashtags as ex
+
+    eq(ex(None), [])
+    eq(ex(""), [])
+    eq(ex("Buy milk"), [])
+    eq(ex("Buy milk #shopping"), ["shopping"])
+    eq(ex("#Work meeting #urgent #q2-plan"), ["Work", "urgent", "q2-plan"])
     # Don't pick up email-style # in URLs/strings (no leading word boundary)
-    eq(_extract_tags("see foo#bar later"), [])
+    eq(ex("see foo#bar later"), [])
+
+    # The old name must stay gone, so nothing can quietly go on calling it.
+    import apple_reminders_mcp.reminders as rem
+    truthy(
+        not hasattr(rem, "_extract_tags"),
+        "_extract_tags still exists — callers could keep treating scraped "
+        "text as real tags",
+    )
+
+
+@test("A", "scraped hashtags never populate `tags`")
+def t_scrape_not_in_tags():
+    """Source guard for the bug this feature fixes.
+
+    _to_detail must fill `tags` from the tag store and `text_hashtags`
+    from the scraper — never the other way round.
+    """
+    src = (ROOT / "src" / "apple_reminders_mcp" / "reminders.py").read_text()
+    detail = src.split("def _to_detail(")[1].split("\n    def ")[0]
+
+    import re
+
+    is_in("text_hashtags=text_hashtags", detail)
+    # Word-boundary match: "text_hashtags=..." must not count as "tags=...".
+    truthy(
+        re.search(r"(?<![\w_])tags=tags\b", detail),
+        "`tags` is not populated from the real tag store",
+    )
+    truthy(
+        not re.search(r"(?<![\w_])tags=text_hashtags\b", detail),
+        "`tags` is being populated from the text scrape",
+    )
+    truthy(
+        "_real_tags_for" in detail,
+        "_to_detail does not consult the real tag store",
+    )
+
+
+@test("A", "TagInfo shape")
+def t_taginfo_shape():
+    from apple_reminders_mcp.models import TagInfo
+
+    t = TagInfo(name="autoreview")
+    eq(t.reminder_count, 0)
+    eq(t.reminder_ids, [])
+    t2 = TagInfo(name="Buy", reminder_count=2, reminder_ids=["A", "B"])
+    eq(t2.reminder_count, 2)
+
+
+@test("A", "version strings agree")
+def t_version_agreement():
+    """manifest.json, pyproject.toml and __version__ must match.
+
+    The package version is what the server reports to the MCP client over
+    the wire, so a stale one makes an installed build lie about itself —
+    it sat at 0.1.2 through two releases before anyone noticed.
+    """
+    import json
+    import re
+
+    manifest = json.loads((ROOT / "manifest.json").read_text())["version"]
+    pyproject = re.search(
+        r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(), re.M
+    ).group(1)
+    from apple_reminders_mcp import __version__
+
+    eq(pyproject, manifest, "pyproject.toml disagrees with manifest.json")
+    eq(__version__, manifest, "__init__.py disagrees with manifest.json")
+
+
+@test("A", "every manifest tool exists on the server")
+def t_manifest_matches_tools():
+    """A tool listed in the manifest but missing from server.py (or the
+    reverse) means the installed extension advertises a surface it does
+    not have."""
+    import json
+
+    from apple_reminders_mcp import server
+
+    listed = {t["name"] for t in json.loads((ROOT / "manifest.json").read_text())["tools"]}
+    for name in listed:
+        truthy(
+            hasattr(server, name),
+            f"manifest lists {name} but server.py has no such tool",
+        )
+    for name in ("add_reminder_tags", "remove_reminder_tags",
+                 "set_reminder_tags", "list_tags"):
+        is_in(name, listed, f"{name} is not advertised in manifest.json")
 
 
 @test("A", "reminder link helper")
@@ -264,6 +368,10 @@ def t_predicate_selectors_exist():
         "predicateForCompletedRemindersWithCompletionDateStarting_ending_calendars_",
         "predicateForRemindersInCalendars_",
         "fetchRemindersMatchingPredicate_completion_",
+        # Used by _refresh_eventkit to stop the store serving stale
+        # snapshots of reminders edited in Reminders.app.
+        "refreshSourcesIfNecessary",
+        "reset",
     ):
         truthy(
             hasattr(EventKit.EKEventStore, selector),
@@ -280,6 +388,404 @@ def t_predicate_selectors_exist():
                 f"reminders.py references non-existent selector prefix {bad!r} "
                 "— the real one is predicateForCompletedReminders..."
             )
+
+
+# ---------------------------------------------------------------------------
+# Tag store — synthetic fixture
+# ---------------------------------------------------------------------------
+
+def _build_fixture_store(path: Path, hashtag_ent: int, fk_col: str) -> None:
+    """Write a miniature Reminders store with the real schema shape.
+
+    Only the columns the reader touches are recreated, but the awkward
+    parts are faithful: the hashtag entity lives in the shared wide
+    ZREMCDOBJECT table, its Z_ENT is parameterised (it really does differ
+    between the iCloud stores and Data-local.sqlite on one Mac), and the
+    reminder foreign key is one of several same-named ZREMINDER* columns.
+    """
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    fk_cols = ", ".join(
+        f"{c} INTEGER" for c in ("ZREMINDER", "ZREMINDER1", "ZREMINDER2",
+                                 "ZREMINDER3", "ZREMINDER4", "ZREMINDER5")
+    )
+    con.executescript(
+        f"""
+        CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER, Z_NAME VARCHAR, Z_SUPER INTEGER, Z_MAX INTEGER);
+        CREATE TABLE ZREMCDHASHTAGLABEL (
+            Z_PK INTEGER PRIMARY KEY, ZNAME VARCHAR, ZCANONICALNAME VARCHAR
+        );
+        CREATE TABLE ZREMCDOBJECT (
+            Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZMARKEDFORDELETION INTEGER,
+            ZHASHTAGLABEL INTEGER, {fk_cols}
+        );
+        CREATE TABLE ZREMCDREMINDER (
+            Z_PK INTEGER PRIMARY KEY, ZTITLE VARCHAR, ZMARKEDFORDELETION INTEGER,
+            ZDACALENDARITEMUNIQUEIDENTIFIER VARCHAR
+        );
+        """
+    )
+    con.execute(
+        "INSERT INTO Z_PRIMARYKEY VALUES (?,?,0,0)", (hashtag_ent, "REMCDHashtag")
+    )
+    # A decoy entity sharing ZREMCDOBJECT, to prove we filter on Z_ENT.
+    con.execute(
+        "INSERT INTO Z_PRIMARYKEY VALUES (?,?,0,0)", (hashtag_ent + 5, "REMCDAlarm")
+    )
+    con.executemany(
+        "INSERT INTO ZREMCDHASHTAGLABEL VALUES (?,?,?)",
+        [(1, "Buy", "buy"), (2, "autoreview", "autoreview"), (3, "Unused", "unused")],
+    )
+    con.executemany(
+        "INSERT INTO ZREMCDREMINDER VALUES (?,?,?,?)",
+        [
+            (10, "Install dishwasher", 0, FIX_A),
+            (11, "Call NovoCare", 0, FIX_B),
+            (12, "Plain reminder, no tags", 0, FIX_C),
+            (13, "Deleted but still tagged", 1, FIX_DELETED),
+        ],
+    )
+    rows = [
+        # (pk, ent, deleted, label, reminder)
+        (100, hashtag_ent, 0, 1, 10),            # Buy       -> A
+        (101, hashtag_ent, 0, 2, 11),            # autoreview-> B
+        (102, hashtag_ent, 0, 1, 11),            # Buy       -> B (two tags)
+        (103, hashtag_ent, 1, 2, 10),            # soft-deleted application
+        (104, hashtag_ent, 1, None, None),       # orphan, as seen in the wild
+        (105, hashtag_ent, 0, 1, 13),            # on a deleted reminder
+        (106, hashtag_ent + 5, 0, 1, 12),        # different entity entirely
+    ]
+    for pk, ent, deleted, label, rem in rows:
+        cols = ["Z_PK", "Z_ENT", "ZMARKEDFORDELETION", "ZHASHTAGLABEL", fk_col]
+        con.execute(
+            f"INSERT INTO ZREMCDOBJECT ({', '.join(cols)}) VALUES (?,?,?,?,?)",
+            (pk, ent, deleted, label, rem),
+        )
+    con.commit()
+    con.close()
+
+
+FIX_A = "AAAAAAAA-0000-0000-0000-000000000001"
+FIX_B = "BBBBBBBB-0000-0000-0000-000000000002"
+FIX_C = "CCCCCCCC-0000-0000-0000-000000000003"
+FIX_DELETED = "DDDDDDDD-0000-0000-0000-000000000004"
+
+
+@test("A", "reads refresh the EventKit store first")
+def t_reads_refresh():
+    """Guard against the stale-read bug returning.
+
+    EKEventStore hands out object snapshots and caches them, so a
+    long-lived MCP process will happily re-serve a reminder it fetched
+    minutes ago — which is how an in-app tag edit came back with an
+    unchanged modification_date. Every public entry point that reads or
+    mutates a reminder must refresh before it looks anything up.
+    """
+    import ast
+
+    src = (ROOT / "src" / "apple_reminders_mcp" / "reminders.py").read_text()
+
+    # The cache must never be populated without a way to clear it.
+    is_in("def _refresh_eventkit", src)
+    is_in("self._reminders_by_id.clear()", src)
+
+    tree = ast.parse(src)
+    cls = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RemindersStore"
+    )
+    bodies = {
+        n.name: ast.get_source_segment(src, n)
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef)
+    }
+    for name in (
+        "get_reminder", "list_subtasks", "get_stats", "list_reminders",
+        "create_reminder", "update_reminder", "complete_reminder",
+        "delete_reminder",
+    ):
+        body = bodies.get(name)
+        not_none(body, f"could not find {name} in reminders.py")
+        truthy(
+            "self._refresh_eventkit()" in body,
+            f"{name} does not refresh before reading — it can serve a "
+            "stale snapshot",
+        )
+
+    # create_reminder must refresh BEFORE it allocates, since reset()
+    # invalidates every EKObject including one just created.
+    create = bodies["create_reminder"]
+    truthy(
+        create.index("self._refresh_eventkit()")
+        < create.index("EKReminder.reminderWithEventStore_"),
+        "create_reminder refreshes after allocating, which would "
+        "invalidate the new reminder",
+    )
+
+
+@test("A", "tag store reads a fixture store")
+def t_tagstore_fixture():
+    import tempfile
+
+    from apple_reminders_mcp.tagstore import RemindersTagStore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        # Two accounts with *different* entity ids and FK columns, which is
+        # the real situation: Z_ENT for REMCDHashtag was 32 in the iCloud
+        # stores and 33 in Data-local.sqlite on the same machine.
+        _build_fixture_store(d / "Data-ACCOUNT1.sqlite", 32, "ZREMINDER3")
+        _build_fixture_store(d / "Data-local.sqlite", 33, "ZREMINDER1")
+
+        ts = RemindersTagStore(stores_dir=d)
+        truthy(ts.available(), "fixture store should be readable")
+        eq(ts.unavailable_reason(), None)
+        eq(len(ts.store_paths()), 2)
+
+        eq(ts.tags_for_reminder(FIX_A), ["Buy"])
+        # Sorted, case-insensitively.
+        eq(ts.tags_for_reminder(FIX_B), ["autoreview", "Buy"])
+        # A reminder with no tags reads as [] — definitely not None.
+        eq(ts.tags_for_reminder(FIX_C), [])
+        # Soft-deleted reminders are excluded.
+        eq(ts.tags_for_reminder(FIX_DELETED), [])
+        # Ids are matched case-insensitively.
+        eq(ts.tags_for_reminder(FIX_A.lower()), ["Buy"])
+
+        # A soft-deleted tag application must not resurface (row 103 put
+        # `autoreview` on reminder A).
+        truthy(
+            "autoreview" not in ts.tags_for_reminder(FIX_A),
+            "soft-deleted tag application leaked into results",
+        )
+        # And a row belonging to a different entity must not be read as a
+        # tag (row 106 points at reminder C).
+        eq(ts.tags_for_reminder(FIX_C), [])
+
+
+@test("A", "tag store list_tags and filtering")
+def t_tagstore_list_and_filter():
+    import tempfile
+
+    from apple_reminders_mcp.tagstore import RemindersTagStore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _build_fixture_store(d / "Data-ACCOUNT1.sqlite", 32, "ZREMINDER3")
+        ts = RemindersTagStore(stores_dir=d)
+
+        tags = {t.name: t for t in ts.list_tags()}
+        eq(set(tags), {"Buy", "autoreview", "Unused"})
+        eq(tags["Buy"].reminder_count, 2)          # reminders A and B
+        eq(tags["autoreview"].reminder_count, 1)   # reminder B
+        # A tag that exists but is applied to nothing is still a tag.
+        eq(tags["Unused"].reminder_count, 0)
+        eq(tags["Unused"].reminder_ids, [])
+        eq(sorted(tags["Buy"].reminder_ids), sorted([FIX_A, FIX_B]))
+        # Most-used first.
+        eq([t.name for t in ts.list_tags()][0], "Buy")
+
+        # Matching is case-insensitive and the "#" sigil is optional.
+        eq(ts.reminders_with_tags(["autoreview"]), {FIX_B})
+        eq(ts.reminders_with_tags(["#AUTOREVIEW"]), {FIX_B})
+        eq(ts.reminders_with_tags(["  #Autoreview "]), {FIX_B})
+        eq(ts.reminders_with_tags(["nonexistent"]), set())
+        eq(ts.reminders_with_tags([]), set())
+        eq(ts.reminders_with_tags([""]), set())
+
+        # any-of vs all-of
+        eq(ts.reminders_with_tags(["buy", "autoreview"]), {FIX_A, FIX_B})
+        eq(
+            ts.reminders_with_tags(["buy", "autoreview"], match_all=True),
+            {FIX_B},
+        )
+
+
+@test("A", "tag store reports an unreadable store instead of empty tags")
+def t_tagstore_missing():
+    import tempfile
+
+    from apple_reminders_mcp.tagstore import RemindersTagStore, TagStoreError
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ts = RemindersTagStore(stores_dir=Path(tmp) / "nope")
+        truthy(not ts.available())
+        reason = ts.unavailable_reason()
+        not_none(reason, "an unreadable store must explain itself")
+        is_in("Full Disk Access", reason)
+        # The failure must be loud, not an empty list that reads as "no tags".
+        try:
+            ts.tags_for_reminder(FIX_A)
+        except TagStoreError:
+            pass
+        else:
+            raise AssertionError(
+                "tags_for_reminder returned instead of raising on an "
+                "unreadable store — callers would read that as 'no tags'"
+            )
+
+
+@test("A", "tag store never opens the real store for writing")
+def t_tagstore_read_only():
+    """The store belongs to Reminders.app. We only ever read it."""
+    src = (ROOT / "src" / "apple_reminders_mcp" / "tagstore.py").read_text()
+    is_in("mode=ro", src)
+    is_in("PRAGMA query_only", src)
+    for forbidden in ("INSERT ", "UPDATE ", "DELETE FROM", "DROP ", "mode=rw"):
+        truthy(
+            forbidden not in src,
+            f"tagstore.py contains {forbidden!r} — it must never write",
+        )
+
+
+@test("A", "tag name normalisation")
+def t_tag_name_normalise():
+    from apple_reminders_mcp.tagwriter import normalise_tag_name as n
+
+    eq(n("autoreview"), "autoreview")
+    eq(n("#autoreview"), "autoreview")
+    eq(n("  #Work "), "Work")
+    eq(n("##double"), "double")
+    eq(n(""), "")
+    eq(n("   "), "")
+
+
+@test("A", "tag writer declares what it needs before using it")
+def t_tag_writer_capabilities():
+    """A macOS update must break loudly, not half-apply a write.
+
+    The writer drives private ReminderKit, so every class and selector it
+    calls is listed up front and checked before anything is mutated.
+    """
+    import ast
+
+    from apple_reminders_mcp import tagwriter
+
+    src = (ROOT / "src" / "apple_reminders_mcp" / "tagwriter.py").read_text()
+
+    # Every selector the module actually calls on a ReminderKit object
+    # must appear in the declared capability table.
+    declared = {
+        f"{cls}.{sel}"
+        for cls, sels in tagwriter._REQUIRED.items()
+        for sel in sels
+    }
+    flat = {sel for sels in tagwriter._REQUIRED.values() for sel in sels}
+    for selector in (
+        "fetchReminderWithDACalendarItemUniqueIdentifier_inList_error_",
+        "updateReminder_",
+        "saveSynchronouslyWithError_",
+        "addHashtagWithType_name_",
+        "removeHashtag_",
+        "hashtagContext",
+    ):
+        is_in(selector, flat, f"{selector} is called but not declared")
+    truthy(declared, "capability table is empty")
+
+    # The check must run before any mutation can happen: _apply goes
+    # through _rem_store, which loads and verifies.
+    tree = ast.parse(src)
+    cls = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RemindersTagWriter"
+    )
+    apply_fn = next(
+        n for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_apply"
+    )
+    body = ast.get_source_segment(src, apply_fn)
+    truthy(
+        body.index("_rem_store()") < body.index("addHashtagWithType_name_"),
+        "_apply mutates before the capability check has run",
+    )
+
+
+@test("A", "tag writer never falls back to writing the store file")
+def t_tag_writer_no_sqlite():
+    """Hand-editing the Core Data store would corrupt CloudKit sync."""
+    src = (ROOT / "src" / "apple_reminders_mcp" / "tagwriter.py").read_text()
+    for forbidden in ("sqlite3", "INSERT ", "UPDATE ", "DELETE FROM"):
+        truthy(
+            forbidden not in src,
+            f"tagwriter.py references {forbidden!r} — writes must go "
+            "through ReminderKit, never the store file",
+        )
+
+
+@test("A", "tag write tools refuse cleanly when unavailable")
+def t_tag_write_guard():
+    """An unavailable write path must raise, never silently no-op."""
+    from apple_reminders_mcp import server
+
+    class _Store:
+        def tag_writes_unavailable_reason(self):
+            return "ReminderKit did not load"
+
+    try:
+        server._require_tag_writes(_Store())
+    except RuntimeError as exc:
+        is_in("ReminderKit did not load", str(exc))
+    else:
+        raise AssertionError("_require_tag_writes did not raise")
+
+    class _OkStore:
+        def tag_writes_unavailable_reason(self):
+            return None
+
+    server._require_tag_writes(_OkStore())  # must not raise
+
+
+@test("A", "tag writes are a separate capability from tag reads")
+def t_tag_read_write_separate():
+    """Reads use the store file; writes use ReminderKit.
+
+    Conflating them would mean a machine without Full Disk Access
+    reports that it cannot write either, which is false.
+    """
+    import ast
+
+    src = (ROOT / "src" / "apple_reminders_mcp" / "reminders.py").read_text()
+    tree = ast.parse(src)
+    cls = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RemindersStore"
+    )
+    fns = {
+        n.name: ast.get_source_segment(src, n)
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef)
+    }
+    for name in ("tags_unavailable_reason", "tag_writes_unavailable_reason"):
+        not_none(fns.get(name), f"{name} is missing")
+    is_in("self._tags.", fns["tags_unavailable_reason"])
+    is_in("self._tag_writer.", fns["tag_writes_unavailable_reason"])
+
+    # A failed tag write during create must not claim the reminder failed.
+    create = fns["create_reminder"]
+    is_in("tags_unavailable_reason", create)
+    truthy(
+        "raise" not in create.split("if tags:")[1].split("return self._to_detail(r)")[0],
+        "a failed tag write raises out of create_reminder, which would "
+        "imply the reminder was not created",
+    )
+
+
+@test("A", "tag writer loads ReminderKit on this machine")
+def t_tag_writer_loads():
+    """Not a live write — just that the private API still matches.
+
+    This runs without Reminders permission, so it is the earliest place a
+    macOS update that renames a selector will show up.
+    """
+    from apple_reminders_mcp.tagwriter import RemindersTagWriter
+
+    w = RemindersTagWriter()
+    reason = w.unavailable_reason()
+    if reason is not None and "does not appear to provide" in reason:
+        skip(f"ReminderKit unavailable on this macOS: {reason}")
+    eq(reason, None, "ReminderKit no longer matches what the writer calls")
+    truthy(w.available())
 
 
 class _FakeSource:
@@ -413,6 +919,116 @@ def t_list_source_fallback():
     local = _FakeSource("s2", "On My Mac", EKSourceTypeLocal, 0)
     store = _store_with([local, icloud])
     eq(str(store._choose_list_source(None).title()), "iCloud")
+
+
+# ---------------------------------------------------------------------------
+# Group C — Live local Reminders store (needs Full Disk Access, not TCC)
+# ---------------------------------------------------------------------------
+
+_real_tagstore = None
+_real_tagstore_skip: Optional[str] = None
+
+
+def _real_tagstore_or_skip():
+    global _real_tagstore, _real_tagstore_skip
+    if _real_tagstore is not None:
+        return _real_tagstore
+    if _real_tagstore_skip is not None:
+        skip(_real_tagstore_skip)
+    from apple_reminders_mcp.tagstore import RemindersTagStore
+
+    ts = RemindersTagStore()
+    reason = ts.unavailable_reason()
+    if reason is not None:
+        _real_tagstore_skip = f"Local Reminders store unreadable: {reason}"
+        skip(_real_tagstore_skip)
+    _real_tagstore = ts
+    return ts
+
+
+@test("C", "real tags read from the live Reminders store")
+def t_real_tags_live():
+    ts = _real_tagstore_or_skip()
+    tags = ts.list_tags()
+    truthy(isinstance(tags, list), "list_tags must return a list")
+    for t in tags:
+        truthy(bool(t.name), "a tag with no name came back")
+        truthy(
+            not t.name.startswith("#"),
+            f"tag {t.name!r} carries a '#' — names are stored without it",
+        )
+        eq(len(t.reminder_ids), t.reminder_count)
+        # Every id must look like the EventKit calendarItemIdentifier.
+        for rid in t.reminder_ids:
+            eq(len(rid), 36, f"{rid!r} is not a dashed UUID")
+            eq(rid, rid.upper(), f"{rid!r} should be upper-case")
+
+    # Round-trip: each tag's members must report that tag back.
+    for t in tags:
+        for rid in t.reminder_ids[:5]:
+            is_in(
+                t.name, ts.tags_for_reminder(rid),
+                f"{rid} is listed under {t.name!r} but does not report it",
+            )
+
+
+@test("C", "real tags are independent of '#' text")
+def t_real_tags_vs_text():
+    """The heart of the bug: text and tags are unrelated.
+
+    A reminder with a real tag need not contain '#' anywhere, and '#text'
+    in a title creates no tag. Asserted against whatever the live store
+    actually holds, so it stays honest as the data changes.
+    """
+    ts = _real_tagstore_or_skip()
+    from apple_reminders_mcp.reminders import _extract_text_hashtags
+
+    import sqlite3
+
+    titles: dict[str, str] = {}
+    for path in ts.store_paths():
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            con.row_factory = sqlite3.Row
+            for row in con.execute(
+                "SELECT upper(ZDACALENDARITEMUNIQUEIDENTIFIER) AS uuid, "
+                "ZTITLE AS title, ZNOTES AS notes FROM ZREMCDREMINDER "
+                "WHERE ZDACALENDARITEMUNIQUEIDENTIFIER IS NOT NULL"
+            ):
+                titles[row["uuid"]] = f"{row['title'] or ''}\n{row['notes'] or ''}"
+            con.close()
+        except sqlite3.Error as exc:
+            skip(f"Could not read reminder titles: {exc}")
+
+    tagged = ts.tags_by_reminder()
+    if not tagged:
+        skip("No tagged reminders in the live store to compare against")
+
+    # At least one real tag must be invisible to the text scrape — that is
+    # the false negative the old code produced.
+    false_negatives = [
+        rid for rid, names in tagged.items()
+        if names and not _extract_text_hashtags(titles.get(rid, ""))
+    ]
+    truthy(
+        false_negatives,
+        "expected at least one reminder whose real tags do not appear as "
+        "'#text' — if this fails the comparison proves nothing",
+    )
+
+    # Conversely, text hashtags that correspond to no real tag are the
+    # false positives the old code reported as `tags`.
+    false_positives = [
+        rid for rid, text in titles.items()
+        if _extract_text_hashtags(text)
+        and not {h.casefold() for h in _extract_text_hashtags(text)}
+        <= {n.casefold() for n in tagged.get(rid, [])}
+    ]
+    print(
+        f"      (live store: {len(tagged)} tagged reminders, "
+        f"{len(false_negatives)} invisible to the text scrape, "
+        f"{len(false_positives)} '#text' reminders with no matching real tag)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -751,6 +1367,132 @@ def t_completed_with_due_bounds():
     )
 
 
+@test("B", "real tag write round-trip")
+def t_tag_write_round_trip():
+    """Add / remove / set real tags on a throwaway reminder.
+
+    Needs both halves: Reminders permission for the ReminderKit write,
+    and Full Disk Access for the store read that independently confirms
+    it. Asserting only against the writer's own return value would prove
+    nothing — the whole point is that the tag really lands in Reminders.
+    """
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+
+    reason = store.tag_writes_unavailable_reason()
+    if reason is not None:
+        skip(f"Tag writes unavailable: {reason}")
+
+    from apple_reminders_mcp.tagstore import RemindersTagStore
+
+    fresh = RemindersTagStore()
+    if fresh.unavailable_reason() is not None:
+        skip("Full Disk Access needed to verify tag writes independently")
+
+    item = store.create_reminder(title="zztagwrite subject", list_id=list_id)
+    _track(item.id)
+    eq(item.tags, [], "a new reminder should start with no tags")
+
+    def from_store():
+        # A fresh reader each time: a cached one could mask a write that
+        # never actually reached the store.
+        return RemindersTagStore().tags_for_reminder(item.id)
+
+    # --- add -------------------------------------------------------------
+    detail = store.add_tags(item.id, ["zztest-alpha"])
+    eq(detail.tags, ["zztest-alpha"])
+    eq(from_store(), ["zztest-alpha"], "tag did not reach the Reminders store")
+
+    # Adding again must not duplicate.
+    detail = store.add_tags(item.id, ["zztest-alpha"])
+    eq(detail.tags, ["zztest-alpha"], "adding an existing tag duplicated it")
+    # Nor should a different casing of the same tag.
+    detail = store.add_tags(item.id, ["ZZTEST-ALPHA"])
+    eq(len(detail.tags), 1, "case variant created a second tag")
+
+    # A leading '#' is accepted and stripped.
+    detail = store.add_tags(item.id, ["#zztest-beta"])
+    eq(sorted(detail.tags), ["zztest-alpha", "zztest-beta"])
+    eq(sorted(from_store()), ["zztest-alpha", "zztest-beta"])
+
+    # --- the real tag must be independent of the title text --------------
+    detail = store.get_reminder(item.id)
+    eq(sorted(detail.tags), ["zztest-alpha", "zztest-beta"])
+    eq(detail.text_hashtags, [], "title has no '#' yet text_hashtags is set")
+    truthy("#" not in detail.title, "test reminder title should carry no '#'")
+
+    # --- remove ----------------------------------------------------------
+    detail = store.remove_tags(item.id, ["zztest-alpha"])
+    eq(detail.tags, ["zztest-beta"])
+    eq(from_store(), ["zztest-beta"])
+    # Removing something absent is a no-op, not an error.
+    detail = store.remove_tags(item.id, ["not-there-at-all"])
+    eq(detail.tags, ["zztest-beta"])
+
+    # --- set (replace) ---------------------------------------------------
+    detail = store.set_tags(item.id, ["zztest-gamma", "zztest-beta"])
+    eq(sorted(detail.tags), ["zztest-beta", "zztest-gamma"])
+    eq(sorted(from_store()), ["zztest-beta", "zztest-gamma"])
+
+    # --- clear -----------------------------------------------------------
+    detail = store.set_tags(item.id, [])
+    eq(detail.tags, [])
+    eq(from_store(), [], "tags were not cleared in the Reminders store")
+
+
+@test("B", "create_reminder applies tags")
+def t_create_with_tags():
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+    if store.tag_writes_unavailable_reason() is not None:
+        skip("Tag writes unavailable")
+
+    item = store.create_reminder(
+        title="zztagcreate subject", list_id=list_id, tags=["#zztest-delta"]
+    )
+    _track(item.id)
+    eq(item.tags, ["zztest-delta"])
+    eq(item.tags_unavailable_reason, None)
+
+    from apple_reminders_mcp.tagstore import RemindersTagStore
+    if RemindersTagStore().unavailable_reason() is None:
+        eq(RemindersTagStore().tags_for_reminder(item.id), ["zztest-delta"])
+
+
+@test("B", "tag filter matches real tags, not '#' text")
+def t_tag_filter_live():
+    """A '#token' in the title must not satisfy a tag filter."""
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+    if store.tag_writes_unavailable_reason() is not None:
+        skip("Tag writes unavailable")
+
+    tagged = store.create_reminder(title="zzfilter really tagged", list_id=list_id)
+    _track(tagged.id)
+    store.add_tags(tagged.id, ["zztest-filter"])
+
+    # Same word, but only as text in the title.
+    decoy = store.create_reminder(
+        title="zzfilter decoy #zztest-filter", list_id=list_id
+    )
+    _track(decoy.id)
+
+    _, rows = store.list_reminders(
+        list_ids=[list_id], tags=["zztest-filter"], limit=200
+    )
+    ids = {r.id for r in rows}
+    is_in(tagged.id, ids, "the genuinely tagged reminder was not returned")
+    truthy(
+        decoy.id not in ids,
+        "a '#token' in the title satisfied a real-tag filter",
+    )
+
+    # And the decoy reports the text separately, with no real tag.
+    detail = store.get_reminder(decoy.id)
+    eq(detail.tags, [])
+    eq(detail.text_hashtags, ["zztest-filter"])
+
+
 # ---------------------------------------------------------------------------
 # Tear-down
 # ---------------------------------------------------------------------------
@@ -789,7 +1531,11 @@ def _print_report() -> int:
     for status, group, name, detail in _results:
         if group != cur_group:
             cur_group = group
-            label = "Static" if group == "A" else "Live (EventKit)"
+            label = {
+                "A": "Static",
+                "B": "Live (EventKit)",
+                "C": "Live (local Reminders store)",
+            }.get(group, group)
             print(f"\n[Group {group}] {label}")
         marker = {"PASS": "✓", "FAIL": "✗", "SKIP": "–"}[status]
         line = f"  {marker} {name}"

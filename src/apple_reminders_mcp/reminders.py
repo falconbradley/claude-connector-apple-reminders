@@ -65,7 +65,10 @@ from .models import (
     ReminderSummary,
     RemindersStats,
     SearchResult,
+    TagInfo,
 )
+from .tagstore import RemindersTagStore, TagStoreError
+from .tagwriter import RemindersTagWriter, TagWriteError, TagWriteUnavailable
 from .permissions import (
     PermissionDeniedError,
     authorization_status_label,
@@ -117,6 +120,8 @@ _SOURCE_TYPE_LABEL = {
     EKSourceTypeBirthdays: "birthday",
 }
 
+# Matches a "#token" in free text. This finds *text*, not Apple tags — see
+# _extract_text_hashtags.
 _HASHTAG_RE = re.compile(r"(?<!\w)#([\w\-]+)")
 
 _PRIORITY_VALID: set[int] = {0, 1, 5, 9}
@@ -392,7 +397,15 @@ def _structured_location_to_model(sloc: Any) -> Optional[LocationSpec]:
     )
 
 
-def _extract_tags(text: Optional[str]) -> list[str]:
+def _extract_text_hashtags(text: Optional[str]) -> list[str]:
+    """Scrape "#token" strings out of free text.
+
+    These are NOT Apple Reminders tags. Typing "#foo" into a title or note
+    creates no tag — the text just sits there. Real tags live in the app's
+    own store and are read by tagstore.py. This helper exists only because
+    some callers use text conventions of their own; the result is surfaced
+    as ``text_hashtags`` so it can never pass for the real thing.
+    """
     if not text:
         return []
     return _HASHTAG_RE.findall(text)
@@ -414,7 +427,19 @@ class RemindersStore:
         self._store = EKEventStore.alloc().init()
         self._access_granted = False
         self._lists_by_id: dict[str, Any] = {}  # cache: id → EKCalendar
-        self._reminders_by_id: dict[str, Any] = {}  # cache: id → EKReminder
+        # Short-lived cache: id → EKReminder. EventKit hands out snapshots,
+        # so anything left here across a refresh would be served stale.
+        # _refresh_eventkit() clears it; never let it outlive a call chain.
+        self._reminders_by_id: dict[str, Any] = {}
+        # Real tags are invisible to EventKit; this reads them from the
+        # Reminders app's own store. Constructed lazily-cheap (no I/O until
+        # first query) so a missing store cannot break EventKit bootstrap.
+        self._tags = RemindersTagStore()
+        # Writing tags has no supported route at all, so it goes through
+        # Apple's private ReminderKit — see tagwriter.py for why, and for
+        # the capability check that keeps an OS change from half-applying
+        # a write. Reading does not depend on this.
+        self._tag_writer = RemindersTagWriter()
 
         self._ensure_access()
         self._refresh_lists()
@@ -456,6 +481,30 @@ class RemindersStore:
     def _refresh_lists(self) -> None:
         cals = self._store.calendarsForEntityType_(EKEntityTypeReminder) or []
         self._lists_by_id = {str(c.calendarIdentifier()): c for c in cals}
+
+    def _refresh_eventkit(self) -> None:
+        """Make this process see edits made elsewhere (Reminders.app, iCloud).
+
+        EKEventStore hands out object *snapshots* and keeps its own cache;
+        neither notices external writes on its own. Without this, a
+        long-lived MCP server answers get_reminder from whatever it first
+        fetched — which is how an in-app tag edit could come back as a
+        byte-identical record with an unchanged modification_date.
+
+        refreshSourcesIfNecessary() pulls remote changes; reset() drops the
+        cached graph. reset() invalidates every EKObject we hold, so the
+        calendar map and the reminder cache are rebuilt straight after.
+        """
+        for call in ("refreshSourcesIfNecessary", "reset"):
+            fn = getattr(self._store, call, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("EKEventStore.%s() failed: %s", call, exc)
+        self._reminders_by_id.clear()
+        self._refresh_lists()
 
     def list_lists(self) -> list[ReminderList]:
         self._refresh_lists()
@@ -776,10 +825,16 @@ class RemindersStore:
         children = self._children_of(r)
         subtask_ids = [str(c.calendarItemIdentifier()) for c in children]
 
-        tags = _extract_tags(summary.title) + _extract_tags(notes)
+        text_hashtags = (
+            _extract_text_hashtags(summary.title) + _extract_text_hashtags(notes)
+        )
         # de-dup preserving order
         seen: set[str] = set()
-        tags = [t for t in tags if not (t in seen or seen.add(t))]
+        text_hashtags = [
+            t for t in text_hashtags if not (t in seen or seen.add(t))
+        ]
+
+        tags, tags_reason = self._real_tags_for(summary.id)
 
         return ReminderDetail(
             **summary.model_dump(),
@@ -792,9 +847,82 @@ class RemindersStore:
             location=location,
             subtask_ids=subtask_ids,
             tags=tags,
+            tags_unavailable_reason=tags_reason,
+            text_hashtags=text_hashtags,
             creation_date=_ns_date_to_datetime(r.creationDate()),
             modification_date=_ns_date_to_datetime(r.lastModifiedDate()),
         )
+
+    # Real tags --------------------------------------------------------
+
+    def _real_tags_for(
+        self, reminder_id: str
+    ) -> tuple[Optional[list[str]], Optional[str]]:
+        """Read one reminder's real tags.
+
+        Returns (tags, None) on success or (None, reason) when the local
+        store is unreadable. The distinction matters: an empty list means
+        "this reminder has no tags", while None means "we could not tell" —
+        collapsing the two is what let a fabricated tag list look
+        authoritative for weeks.
+        """
+        try:
+            return self._tags.tags_for_reminder(reminder_id), None
+        except TagStoreError as exc:
+            logger.warning("Real tags unavailable: %s", exc)
+            return None, str(exc)
+
+    def list_tags(self) -> list[TagInfo]:
+        """Every real tag across every account, with usage counts."""
+        return self._tags.list_tags()
+
+    def tags_available(self) -> bool:
+        return self._tags.available()
+
+    def tags_unavailable_reason(self) -> Optional[str]:
+        """Why real-tag reads would fail, or None when they work."""
+        return self._tags.unavailable_reason()
+
+    def tag_writes_unavailable_reason(self) -> Optional[str]:
+        """Why real-tag writes would fail, or None when they work.
+
+        Separate from the read path: reading uses the store file, writing
+        uses ReminderKit, and either can be unavailable on its own.
+        """
+        return self._tag_writer.unavailable_reason()
+
+    def _detail_after_tag_write(
+        self, reminder_id: str, tags: list[str]
+    ) -> ReminderDetail:
+        """Rebuild a reminder's detail after ReminderKit changed its tags.
+
+        `tags` comes from the writer's own read-back rather than from the
+        store file, which remindd may not have flushed yet. EventKit is
+        refreshed first, since the save also bumped the modification date.
+        """
+        self._refresh_eventkit()
+        r = self._lookup_reminder(reminder_id)
+        if r is None:
+            raise ValueError(f"Reminder not found: {reminder_id}")
+        detail = self._to_detail(r)
+        detail.tags = tags
+        detail.tags_unavailable_reason = None
+        return detail
+
+    def add_tags(self, reminder_id: str, tags: list[str]) -> ReminderDetail:
+        """Add real tags to a reminder. Already-present tags are skipped."""
+        result = self._tag_writer.add_tags(reminder_id, tags)
+        return self._detail_after_tag_write(reminder_id, result)
+
+    def remove_tags(self, reminder_id: str, tags: list[str]) -> ReminderDetail:
+        """Remove real tags from a reminder. Absent tags are ignored."""
+        result = self._tag_writer.remove_tags(reminder_id, tags)
+        return self._detail_after_tag_write(reminder_id, result)
+
+    def set_tags(self, reminder_id: str, tags: list[str]) -> ReminderDetail:
+        """Replace a reminder's real tags. An empty list clears them."""
+        result = self._tag_writer.set_tags(reminder_id, tags)
+        return self._detail_after_tag_write(reminder_id, result)
 
     # Subtask helpers --------------------------------------------------
 
@@ -855,17 +983,40 @@ class RemindersStore:
         due_after: Optional[datetime] = None,
         has_subtasks: Optional[bool] = None,
         text: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        match_all_tags: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[ReminderSummary]]:
         if priority is not None and priority not in _PRIORITY_VALID:
             raise ValueError(f"priority must be one of {sorted(_PRIORITY_VALID)}")
+        # Resolve the tag filter before any EventKit work: if the local
+        # store is unreadable we must fail loudly, never quietly return
+        # every reminder as though none were filtered out.
+        tag_ids: Optional[set[str]] = None
+        if tags:
+            try:
+                tag_ids = self._tags.reminders_with_tags(
+                    tags, match_all=match_all_tags
+                )
+            except TagStoreError as exc:
+                raise RuntimeError(
+                    f"Cannot filter by tag: {exc}"
+                ) from exc
+            if not tag_ids:
+                return 0, []
+        self._refresh_eventkit()
         lists = self._resolve_lists(list_ids)
         pred = self._build_predicate(lists, completed, due_before, due_after)
         rows = self._fetch(pred)
         rows = self._post_filter(
             rows, text, priority, due_before, due_after, completed, has_subtasks
         )
+        if tag_ids is not None:
+            rows = [
+                r for r in rows
+                if str(r.calendarItemIdentifier()).upper() in tag_ids
+            ]
         # Stable sort: incomplete first, then by due date (None last), then title.
         def sort_key(r: Any) -> tuple[int, float, str]:
             done = 1 if r.isCompleted() else 0
@@ -889,6 +1040,8 @@ class RemindersStore:
         priority: Optional[int] = None,
         due_before: Optional[datetime] = None,
         due_after: Optional[datetime] = None,
+        tags: Optional[list[str]] = None,
+        match_all_tags: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[ReminderSummary]]:
@@ -899,24 +1052,28 @@ class RemindersStore:
             due_before=due_before,
             due_after=due_after,
             text=query,
+            tags=tags,
+            match_all_tags=match_all_tags,
             limit=limit,
             offset=offset,
         )
 
     def get_reminder(self, reminder_id: str) -> Optional[ReminderDetail]:
+        self._refresh_eventkit()
         r = self._lookup_reminder(reminder_id)
         if r is None:
             return None
         return self._to_detail(r)
 
     def list_subtasks(self, reminder_id: str) -> list[ReminderSummary]:
+        self._refresh_eventkit()
         r = self._lookup_reminder(reminder_id)
         if r is None:
             raise ValueError(f"Reminder not found: {reminder_id}")
         return [self._to_summary(c) for c in self._children_of(r)]
 
     def get_stats(self) -> RemindersStats:
-        self._refresh_lists()
+        self._refresh_eventkit()
         all_lists = list(self._lists_by_id.values())
         if not all_lists:
             return RemindersStats(
@@ -957,6 +1114,8 @@ class RemindersStore:
     # ------------------------------------------------------------------
 
     def _lookup_reminder(self, reminder_id: str) -> Optional[Any]:
+        # Only trust the cache within a call chain; _refresh_eventkit()
+        # clears it, so a fresh read never sees a stale snapshot.
         cached = self._reminders_by_id.get(reminder_id)
         if cached is not None:
             return cached
@@ -981,11 +1140,17 @@ class RemindersStore:
         alarms: Optional[list[AlarmSpec]] = None,
         location: Optional[LocationSpec] = None,
         parent_id: Optional[str] = None,
+        tags: Optional[list[str]] = None,
     ) -> ReminderDetail:
         if not title or not title.strip():
             raise ValueError("Reminder title must be a non-empty string.")
         if priority not in _PRIORITY_VALID:
             raise ValueError(f"priority must be one of {sorted(_PRIORITY_VALID)}")
+
+        # Refresh before allocating, not after: reset() invalidates every
+        # EKObject, so the new reminder (and a parent looked up below) must
+        # come from the store as it stands after the refresh.
+        self._refresh_eventkit()
 
         r = EKReminder.reminderWithEventStore_(self._store)
         r.setTitle_(title.strip())
@@ -1043,6 +1208,25 @@ class RemindersStore:
 
         ident = str(r.calendarItemIdentifier())
         self._reminders_by_id[ident] = r
+
+        if tags:
+            # The reminder exists at this point. Tagging is a second,
+            # independent write through ReminderKit, so if it fails the
+            # reminder still stands — say so in the detail rather than
+            # raising, which would imply nothing was created.
+            try:
+                applied = self._tag_writer.add_tags(ident, tags)
+                return self._detail_after_tag_write(ident, applied)
+            except (TagWriteError, ValueError) as exc:
+                logger.warning("Reminder %s created but not tagged: %s",
+                               ident, exc)
+                detail = self._to_detail(r)
+                detail.tags_unavailable_reason = (
+                    f"Reminder was created, but its tags were not applied: "
+                    f"{exc}"
+                )
+                return detail
+
         return self._to_detail(r)
 
     def update_reminder(
@@ -1067,6 +1251,7 @@ class RemindersStore:
         clear_url: bool = False,
         clear_notes: bool = False,
     ) -> ReminderDetail:
+        self._refresh_eventkit()
         r = self._lookup_reminder(reminder_id)
         if r is None:
             raise ValueError(f"Reminder not found: {reminder_id}")
@@ -1136,6 +1321,7 @@ class RemindersStore:
         reminder_id: str,
         completed: Optional[bool] = None,
     ) -> ReminderDetail:
+        self._refresh_eventkit()
         r = self._lookup_reminder(reminder_id)
         if r is None:
             raise ValueError(f"Reminder not found: {reminder_id}")
@@ -1155,6 +1341,7 @@ class RemindersStore:
         reminder_id: str,
         cascade: bool = True,
     ) -> DeleteResult:
+        self._refresh_eventkit()
         r = self._lookup_reminder(reminder_id)
         if r is None:
             raise ValueError(f"Reminder not found: {reminder_id}")
@@ -1172,6 +1359,7 @@ class RemindersStore:
         return DeleteResult(id=reminder_id, success=True, deleted_subtask_count=deleted_subs)
 
     def get_reminder_link(self, reminder_id: str) -> str:
+        self._refresh_eventkit()
         r = self._lookup_reminder(reminder_id)
         if r is None:
             raise ValueError(f"Reminder not found: {reminder_id}")

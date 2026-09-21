@@ -28,6 +28,29 @@ Reminders — read
   get_reminder             - Full detail for one reminder
   get_reminder_link        - x-apple-reminderkit:// URL
   list_subtasks            - Children of a parent reminder
+  list_tags                - Every real Apple Reminders tag, with usage counts
+
+Reminders — tags (write)
+  add_reminder_tags        - Add real tags to a reminder
+  remove_reminder_tags     - Remove real tags from a reminder
+  set_reminder_tags        - Replace a reminder's tags outright
+
+Tags
+----
+Real tags — the chips you see on a reminder in Reminders.app — are NOT
+exposed by EventKit or by Reminders' AppleScript dictionary. They are read
+directly from the Reminders app's own Core Data store, which needs Full
+Disk Access for the host process (Claude Desktop). Without it, `tags` comes
+back as null with `tags_unavailable_reason` set, rather than as an empty
+list that would falsely read as "no tags".
+
+Note that `#foo` typed into a title or note is just text and tags nothing.
+That scraped value is reported separately as `text_hashtags`.
+
+Writing tags is a separate capability from reading them: reads come from
+the store file (Full Disk Access), writes go through Apple's private
+ReminderKit framework (Reminders permission). Either can be unavailable
+on its own, and each reports its own reason.
 
 Reminders — write
   create_reminder          - Create with full property set (recurrence, alarms, location, parent)
@@ -59,6 +82,7 @@ from .models import (
     ReminderSummary,
     RemindersStats,
     SearchResult,
+    TagInfo,
 )
 from .permissions import PermissionDeniedError
 
@@ -123,6 +147,17 @@ def _require_store():
         raise RuntimeError(
             f"Could not initialise the Reminders store: {exc}"
         ) from exc
+
+
+def _require_tag_writes(store) -> None:
+    """Fail early, and with a reason, when tags cannot be written.
+
+    Writing tags depends on private ReminderKit; reading them does not.
+    A caller that gets this message should know which half is broken.
+    """
+    reason = store.tag_writes_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(f"Cannot write Apple Reminders tags: {reason}")
 
 
 def _parse_iso(s: Optional[str], field: str) -> Optional[datetime]:
@@ -215,6 +250,8 @@ def list_reminders(
     due_after: Optional[str] = None,
     has_subtasks: Optional[bool] = None,
     text: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    match_all_tags: bool = False,
     limit: int = 50,
     offset: int = 0,
 ) -> SearchResult:
@@ -228,6 +265,10 @@ def list_reminders(
         due_after:    ISO-8601 — only reminders due on/after this time.
         has_subtasks: If true, only reminders with subtasks. If false, only without.
         text:         Substring match on title or notes.
+        tags:         Only reminders carrying these real Apple tags.
+                      Case-insensitive; a leading "#" is optional. This
+                      matches genuine tags, not "#foo" text in the title.
+        match_all_tags: If true, require every tag in `tags`; otherwise any.
         limit:        Max results per page (default 50, max 500).
         offset:       Pagination offset.
     """
@@ -241,6 +282,8 @@ def list_reminders(
         due_after=_parse_iso(due_after, "due_after"),
         has_subtasks=has_subtasks,
         text=text,
+        tags=tags,
+        match_all_tags=match_all_tags,
         limit=limit,
         offset=offset,
     )
@@ -255,6 +298,8 @@ def search_reminders(
     priority: Optional[int] = None,
     due_before: Optional[str] = None,
     due_after: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    match_all_tags: bool = False,
     limit: int = 50,
     offset: int = 0,
 ) -> SearchResult:
@@ -267,6 +312,9 @@ def search_reminders(
         priority:    Filter by priority (0/1/5/9).
         due_before:  ISO-8601 upper bound on due date.
         due_after:   ISO-8601 lower bound on due date.
+        tags:        Only reminders carrying these real Apple tags
+                     (case-insensitive, leading "#" optional).
+        match_all_tags: If true, require every tag in `tags`; otherwise any.
         limit:       Max results (default 50, max 500).
         offset:      Pagination offset.
     """
@@ -281,6 +329,8 @@ def search_reminders(
         priority=priority,
         due_before=_parse_iso(due_before, "due_before"),
         due_after=_parse_iso(due_after, "due_after"),
+        tags=tags,
+        match_all_tags=match_all_tags,
         limit=limit,
         offset=offset,
     )
@@ -289,7 +339,15 @@ def search_reminders(
 
 @mcp.tool()
 def get_reminder(reminder_id: str) -> ReminderDetail:
-    """Fetch a single reminder with all properties (notes, recurrence, alarms, location, subtasks, tags).
+    """Fetch one reminder with all properties.
+
+    Includes notes, recurrence, alarms, location, subtasks, and real tags.
+
+    `tags` holds genuine Apple Reminders tags. It is null (not empty) when
+    the local store could not be read, with the reason in
+    `tags_unavailable_reason`. `text_hashtags` is a separate, purely
+    textual scrape of "#tokens" from the title and notes — those are not
+    tags and never were.
 
     Args:
         reminder_id: Identifier from list_reminders / search_reminders.
@@ -309,6 +367,87 @@ def get_reminder_link(reminder_id: str) -> dict:
     """
     link = _require_store().get_reminder_link(reminder_id)
     return {"reminder_id": reminder_id, "reminder_link": link}
+
+
+@mcp.tool()
+def list_tags() -> list[TagInfo]:
+    """List every real Apple Reminders tag, with how many reminders use it.
+
+    These are the tags shown as chips on a reminder and in the Reminders.app
+    sidebar. Includes tags that exist but are not currently applied to any
+    reminder (count 0), since the app still offers those when filtering.
+
+    Reads the Reminders app's own store, which needs Full Disk Access for
+    the host process; without it this raises rather than returning [].
+    """
+    store = _require_store()
+    reason = store.tags_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(f"Cannot read Apple Reminders tags: {reason}")
+    return store.list_tags()
+
+
+@mcp.tool()
+def add_reminder_tags(reminder_id: str, tags: list[str]) -> ReminderResult:
+    """Add real Apple tags to a reminder.
+
+    These are genuine tags — the chips shown on the reminder in
+    Reminders.app and filterable from its sidebar — not "#text" in the
+    title. Tags that do not exist yet are created; tags already on the
+    reminder are left alone, so calling this twice is safe.
+
+    Writing tags uses Apple's private ReminderKit framework, because no
+    supported API exposes tags at all. It can therefore stop working
+    after a macOS update, in which case this raises with a clear reason
+    rather than silently doing nothing.
+
+    Args:
+        reminder_id: Identifier from list_reminders / search_reminders.
+        tags:        Tag names. A leading "#" is optional.
+    """
+    if not tags:
+        raise ValueError("`tags` must contain at least one tag name.")
+    store = _require_store()
+    _require_tag_writes(store)
+    return ReminderResult(reminder=store.add_tags(reminder_id, tags), success=True)
+
+
+@mcp.tool()
+def remove_reminder_tags(reminder_id: str, tags: list[str]) -> ReminderResult:
+    """Remove real Apple tags from a reminder.
+
+    Names not currently on the reminder are ignored. Removing a tag from
+    its last reminder does not delete the tag itself — Reminders keeps
+    the label, exactly as it does when you do this in the app.
+
+    Args:
+        reminder_id: Identifier from list_reminders / search_reminders.
+        tags:        Tag names to remove. A leading "#" is optional.
+    """
+    if not tags:
+        raise ValueError("`tags` must contain at least one tag name.")
+    store = _require_store()
+    _require_tag_writes(store)
+    return ReminderResult(
+        reminder=store.remove_tags(reminder_id, tags), success=True
+    )
+
+
+@mcp.tool()
+def set_reminder_tags(reminder_id: str, tags: list[str]) -> ReminderResult:
+    """Replace a reminder's real Apple tags with exactly this set.
+
+    Tags not in the list are removed, missing ones are added, and ones
+    already correct are left untouched. Pass an empty list to clear every
+    tag from the reminder.
+
+    Args:
+        reminder_id: Identifier from list_reminders / search_reminders.
+        tags:        The complete desired tag set. Empty list clears all.
+    """
+    store = _require_store()
+    _require_tag_writes(store)
+    return ReminderResult(reminder=store.set_tags(reminder_id, tags), success=True)
 
 
 @mcp.tool()
@@ -339,13 +478,15 @@ def create_reminder(
     alarms: Optional[list[AlarmSpec]] = None,
     location: Optional[LocationSpec] = None,
     parent_id: Optional[str] = None,
+    tags: Optional[list[str]] = None,
 ) -> ReminderResult:
     """Create a new reminder with rich properties.
 
     Args:
-        title:       Non-empty title. May contain '#hashtags'.
+        title:       Non-empty title. Putting '#foo' in it does NOT tag the
+                     reminder — use `tags` for that.
         list_id:     Target list id. If null, uses the default Reminders list.
-        notes:       Optional body text. Hashtags here are also captured.
+        notes:       Optional body text.
         url:         Optional URL to attach.
         due_date:    ISO-8601 due date. If is_all_day=true, the time component is dropped.
         is_all_day:  When true, the due date is stored as a date-only component.
@@ -355,6 +496,11 @@ def create_reminder(
         alarms:      Optional list of AlarmSpec (relative offset, absolute date, or location).
         location:    Optional geofence target. Stored as a location alarm.
         parent_id:   Identifier of a parent reminder to make this a subtask.
+        tags:        Real Apple tags to apply, e.g. ["autoreview"]. A
+                     leading "#" is optional. Tags are applied after the
+                     reminder is created; if that step fails the reminder
+                     still exists and the reason is reported in
+                     `tags_unavailable_reason`.
     """
     if priority not in (0, 1, 5, 9):
         raise ValueError("priority must be one of 0, 1, 5, 9.")
@@ -374,6 +520,7 @@ def create_reminder(
         alarms=alarms,
         location=location,
         parent_id=parent_id,
+        tags=tags,
     )
     return ReminderResult(reminder=detail, success=True)
 

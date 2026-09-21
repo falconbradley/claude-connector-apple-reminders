@@ -35,18 +35,22 @@
     { "name": "update_reminder_list",  "description": "Rename or recolor an existing reminder list" },
     { "name": "delete_reminder_list",  "description": "Delete a reminder list and all its reminders (destructive)" },
     { "name": "get_stats",             "description": "Aggregate counts: list count, total reminders, incomplete, completed, overdue, due today" },
-    { "name": "list_reminders",        "description": "List reminders in one or more lists, with filters: completed, priority, due_before/after, has_subtasks, text" },
-    { "name": "search_reminders",      "description": "Free-text search across reminder titles and notes, with filters for list, completion, priority, and due date" },
-    { "name": "get_reminder",          "description": "Full detail for a reminder — notes, URL, recurrence, alarms, location, subtask ids, tags, timestamps" },
+    { "name": "list_reminders",        "description": "List reminders in one or more lists, with filters: completed, priority, due_before/after, has_subtasks, text, tags" },
+    { "name": "search_reminders",      "description": "Free-text search across reminder titles and notes, with filters for list, completion, priority, due date, and tags" },
+    { "name": "get_reminder",          "description": "Full detail for a reminder — notes, URL, recurrence, alarms, location, subtask ids, real tags, timestamps" },
     { "name": "get_reminder_link",     "description": "Get an x-apple-reminderkit:// URL that opens the reminder in Reminders.app" },
     { "name": "list_subtasks",         "description": "List the immediate subtasks (child reminders) of a parent reminder" },
-    { "name": "create_reminder",       "description": "Create a reminder with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks)" },
+    { "name": "list_tags",             "description": "List every real Apple Reminders tag with the number of reminders using it" },
+    { "name": "add_reminder_tags",     "description": "Add real Apple tags to a reminder (creates tags that do not exist yet; idempotent)" },
+    { "name": "remove_reminder_tags",  "description": "Remove real Apple tags from a reminder" },
+    { "name": "set_reminder_tags",     "description": "Replace a reminder's real Apple tags with exactly the given set; empty list clears them" },
+    { "name": "create_reminder",       "description": "Create a reminder with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks), real tags" },
     { "name": "update_reminder",       "description": "Update any subset of a reminder's properties; explicit clear_* flags remove fields" },
     { "name": "complete_reminder",     "description": "Mark a reminder as complete or uncomplete (or toggle if completed is null)" },
     { "name": "delete_reminder",       "description": "Delete a reminder; cascades to subtasks by default" }
   ],
 
-  "keywords": ["apple", "reminders", "tasks", "todo", "macos", "subtasks", "recurrence", "geofence", "eventkit"],
+  "keywords": ["apple", "reminders", "tasks", "todo", "macos", "subtasks", "recurrence", "geofence", "eventkit", "tags"],
   "license": "MIT",
 
   "compatibility": {

@@ -15,12 +15,16 @@ Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/1
 | `update_reminder_list` | Rename or recolor an existing list |
 | `delete_reminder_list` | Delete a list and all its reminders (destructive) |
 | `get_stats` | Aggregate counts: list count, total, incomplete, completed, overdue, due today |
-| `list_reminders` | Reminders in one or more lists with filters: completed, priority, due date, has-subtasks, text |
+| `list_reminders` | Reminders in one or more lists with filters: completed, priority, due date, has-subtasks, text, tags |
 | `search_reminders` | Free-text search across title and notes, with the same filters |
-| `get_reminder` | Full detail — notes, URL, recurrence, alarms, location, subtask ids, tags, timestamps |
+| `get_reminder` | Full detail — notes, URL, recurrence, alarms, location, subtask ids, real tags, timestamps |
 | `get_reminder_link` | `x-apple-reminderkit://` URL to open the reminder in Reminders.app |
 | `list_subtasks` | Immediate children of a parent reminder |
-| `create_reminder` | Create with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks) |
+| `list_tags` | Every real Apple Reminders tag, with how many reminders carry it |
+| `add_reminder_tags` | Add real tags to a reminder (idempotent; creates new tags) |
+| `remove_reminder_tags` | Remove real tags from a reminder |
+| `set_reminder_tags` | Replace a reminder's tags outright; empty list clears them |
+| `create_reminder` | Create with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks), real tags |
 | `update_reminder` | Update any subset of properties; `clear_*` flags explicitly remove fields |
 | `complete_reminder` | Mark complete or uncomplete (or toggle if `completed` is null) |
 | `delete_reminder` | Delete a reminder; cascades to subtasks by default |
@@ -29,9 +33,101 @@ Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/1
 
 Communication with Reminders happens through **EventKit** (`EKEventStore`, `EKReminder`, `EKCalendar`, `EKRecurrenceRule`, `EKAlarm`, `EKStructuredLocation`) via PyObjC.
 
-This differs from the [companion Apple Mail connector](https://github.com/falconbradley/claude-connector-apple-mail), which uses JXA via `osascript`. Reminders.app's AppleScript dictionary is gap-filled — it has no first-class API for subtasks, hashtag tags, locations, or recurrence read-back. EventKit exposes the full data model and is dramatically faster (~50–200ms for 1000 reminders, vs 5–30s for AppleScript).
+This differs from the [companion Apple Mail connector](https://github.com/falconbradley/claude-connector-apple-mail), which uses JXA via `osascript`. Reminders.app's AppleScript dictionary is gap-filled — it has no first-class API for subtasks, tags, locations, or recurrence read-back. EventKit exposes the full data model and is dramatically faster (~50–200ms for 1000 reminders, vs 5–30s for AppleScript).
 
 The async EventKit fetch API (`fetchRemindersMatchingPredicate:completion:`) is bridged to a synchronous Python interface using a `threading.Event`, so callers see plain return values.
+
+---
+
+## Tags
+
+Reminders' real tags — the chips on a reminder, and the tag filters in the
+Reminders.app sidebar — are **not exposed by any supported API**:
+
+- `EKReminder` / `EKCalendarItem` have no tag property, and a symbol scan of
+  EventKit turns up no private one either.
+- The Reminders AppleScript dictionary has no tag property.
+
+So this connector reads them straight out of the Reminders app's own Core
+Data store, the same way the companion Apple Notes connector reads note
+tags. The store lives at
+
+```
+~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores/
+```
+
+with one SQLite file per account. It is opened strictly read-only
+(`mode=ro` plus `PRAGMA query_only`) and never written; Reminders.app stays
+the only writer and the only sync engine.
+
+**This needs Full Disk Access** for the host process (Claude Desktop), since
+Group Containers are TCC-protected. Everything else in the connector works
+without it. When the store cannot be read, `get_reminder` returns
+`tags: null` with a `tags_unavailable_reason` explaining why — deliberately
+not an empty list, which would read as "this reminder has no tags".
+
+### `tags` vs `text_hashtags`
+
+These are different things and are reported separately:
+
+| Field | What it is |
+|---|---|
+| `tags` | Real Apple tags, read from the Reminders store. `null` if unreadable. |
+| `text_hashtags` | `#tokens` scraped out of the title and notes. Just text. |
+
+Writing `#foo` into a reminder's title **does not tag it**. Earlier versions
+of this connector reported that scrape as `tags`, which was wrong in both
+directions: real tags were invisible, and arbitrary `#tokens` looked like
+tags that did not exist.
+
+### Writing tags
+
+Supported, via `add_reminder_tags`, `remove_reminder_tags`,
+`set_reminder_tags`, and a `tags` argument on `create_reminder`.
+
+**This uses private API, deliberately.** There is no alternative. EventKit
+and AppleScript have no tag concept; Shortcuts/App Intents expose no tag
+parameter; and hand-writing the Core Data store would mean maintaining
+Reminders' CloudKit sync bookkeeping ourselves, which would corrupt it.
+
+So writes go through `ReminderKit`, the framework Reminders.app itself
+uses, driven exactly as the app drives it:
+
+```
+REMStore.fetchReminderWithDACalendarItemUniqueIdentifier:inList:error:
+REMSaveRequest(store).updateReminder:              -> REMReminderChangeItem
+  .hashtagContext.addHashtagWithType:name:(0, "…") -> add
+  .hashtagContext.removeHashtag:                   -> remove
+REMSaveRequest.saveSynchronouslyWithError:
+```
+
+Apple performs the write, so sync, change tracking and validation stay
+Apple's job. Reminder ids need no translation: ReminderKit's
+`DACalendarItemUniqueIdentifier` is the same string EventKit reports as
+`calendarItemIdentifier`.
+
+**The trade-off:** Apple owes this interface nothing, and a macOS update
+could rename or drop a selector. The writer therefore declares every class
+and selector it uses and verifies them *before* touching anything — if the
+interface has moved it refuses with a message naming exactly what went
+missing, rather than half-applying a change. Reading tags is unaffected
+either way; it needs no private API.
+
+Writing needs **Reminders permission** (ReminderKit talks to `remindd`);
+reading needs **Full Disk Access**. These are separate capabilities and
+each reports its own reason when unavailable.
+
+Behaviour worth knowing:
+
+- Adding a tag already on the reminder is a no-op, including across case
+  (`Buy` and `buy` are the same tag to Reminders). No duplicates.
+- Removing a tag that is not present is a no-op, not an error.
+- `set_reminder_tags` diffs rather than clear-and-re-add, so tags that
+  should stay are never briefly removed.
+- Removing a tag from its last reminder does not delete the tag itself —
+  Reminders keeps the label, exactly as it does in the app.
+- A no-change call does not save, so it will not bump the reminder's
+  modification date or wake CloudKit.
 
 ---
 
@@ -41,6 +137,8 @@ The async EventKit fetch API (`fetchRemindersMatchingPredicate:completion:`) is 
 - Python 3.11+
 - Claude Desktop with extension support
 - Reminders permission granted to Claude Desktop (see below)
+- Full Disk Access for Claude Desktop — **only** needed to read real
+  tags; every other tool works without it (see [Tags](#tags))
 
 ---
 
@@ -150,6 +248,8 @@ apple-reminders-mcp/
         ├── __init__.py
         ├── server.py                # MCP tools (MCPServer)
         ├── reminders.py             # EventKit-backed RemindersStore
+        ├── tagstore.py              # Read-only reader for real tags
+        ├── tagwriter.py             # Tag writes via private ReminderKit
         ├── permissions.py           # TCC grant helpers
         └── models.py                # Pydantic data models
 ```
@@ -157,14 +257,26 @@ apple-reminders-mcp/
 ### Tests
 
 ```bash
-# Static tests (model shapes, validation, helpers — no permission needed)
+# Static tests — model shapes, validation, helpers, and the tag reader
+# against a synthetic fixture store. No permissions needed.
 uv run python tests/test_e2e.py --skip-live
 
-# Full suite (requires Reminders permission)
+# Full suite (requires Reminders permission, and Full Disk Access for the
+# tag tests)
 uv run python tests/test_e2e.py
 ```
 
-Live tests operate against a dedicated `__claude_mcp_test__` list which is created at setup and torn down at the end.
+Three groups:
+
+- **A — static.** Always runs. Includes the tag store exercised against a
+  generated fixture that reproduces the awkward parts of the real schema:
+  a per-store entity id, the shared wide object table, soft-deleted rows.
+- **C — live local store.** Reads the real Reminders store; needs Full Disk
+  Access but *not* Reminders permission. Skipped with a reason otherwise.
+- **B — live EventKit.** Operates against a dedicated `__claude_mcp_test__`
+  list, created at setup and torn down at the end. Needs Reminders
+  permission, which a plain shell does not have — run these through the
+  installed connector.
 
 ---
 
@@ -195,14 +307,15 @@ For comparison, the same operations via AppleScript would take 5–30 seconds.
 - [x] Alarms (relative, absolute, location)
 - [x] Location/geofence reminders (enter/leave proximity)
 - [x] Subtasks (parent/child)
-- [x] Hashtag (`#tag`) parsing
+- [x] Real Apple Reminders tags — read, enumerate, filter by, and write them
 - [x] `x-apple-reminderkit://` deep links
 
 **v2 — under consideration**
 - [ ] Smart lists (today, scheduled, all, completed, flagged)
 - [ ] Shared list write-back (currently best-effort; depends on CalDAV permissions)
 - [ ] Bulk operations (delete multiple, complete multiple, move multiple)
-- [ ] Native tags API if Apple ships one
+- [ ] Public tags API if Apple ships one — would let the write path drop private ReminderKit
+
 
 ---
 
