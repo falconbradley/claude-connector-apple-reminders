@@ -1114,7 +1114,11 @@ def t_crud_reminder():
     )
     rid = _track(detail.id)
     eq(detail.priority, 1)
-    is_in("shopping", detail.tags)
+    # "#shopping" is text in the title, not a real Apple tag, so it belongs
+    # to text_hashtags and `tags` must stay empty — same split the decoy in
+    # "tag filter matches real tags" asserts from the other direction.
+    eq(detail.tags, [])
+    is_in("shopping", detail.text_hashtags)
 
     fetched = store.get_reminder(rid)
     not_none(fetched)
