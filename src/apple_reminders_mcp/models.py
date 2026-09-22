@@ -63,6 +63,31 @@ class AlarmSpec(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Linked content
+# ---------------------------------------------------------------------------
+
+# "mail" = a Mail message (message:<Message-ID> URL, renders the Mail chip);
+# "messages" = a Messages chat (chat-level, renders the Messages chip);
+# "web" = an http(s) universal link; "other" = an activity from some other
+# app (e.g. Notes), reported as read but not something this connector writes.
+LinkKind = Literal["mail", "messages", "web", "other"]
+
+
+class LinkedContent(BaseModel):
+    """The Mail / Messages chip on a reminder — its *linked content*.
+
+    This is what Siri's "remind me about this" and the share sheet attach.
+    It is NOT the reminder's `url` field, which Reminders.app never shows.
+    Stored as a REMUserActivity in the app's own database; see
+    linkstore.py for how it is read and linkwriter.py for how it is set.
+    """
+    kind: LinkKind
+    url: Optional[str] = None                 # what opening the chip resolves
+    title: Optional[str] = None               # chat name for Messages; None for Mail
+    activity_type: Optional[str] = None       # NSUserActivity type, when there is one
+
+
+# ---------------------------------------------------------------------------
 # Reminders
 # ---------------------------------------------------------------------------
 
@@ -105,6 +130,11 @@ class ReminderDetail(ReminderSummary):
     # Kept because some callers key off text conventions of their own, but
     # named so it can never be mistaken for the real thing.
     text_hashtags: list[str] = []
+    # Linked content — the Mail / Messages chip. Same convention as `tags`:
+    # None with `link_unavailable_reason` set means the store could not be
+    # read; None with no reason means the reminder simply has no link.
+    link: Optional[LinkedContent] = None
+    link_unavailable_reason: Optional[str] = None
     creation_date: Optional[datetime] = None
     modification_date: Optional[datetime] = None
 

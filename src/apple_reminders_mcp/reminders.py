@@ -55,6 +55,7 @@ from .models import (
     DayOfWeek,
     DeleteResult,
     Frequency,
+    LinkedContent,
     ListResult,
     LocationSpec,
     Priority,
@@ -69,6 +70,8 @@ from .models import (
 )
 from .tagstore import RemindersTagStore, TagStoreError
 from .tagwriter import RemindersTagWriter, TagWriteError, TagWriteUnavailable
+from .linkstore import RemindersLinkStore, LinkStoreError
+from .linkwriter import RemindersLinkWriter, LinkWriteError, parse_link
 from .permissions import (
     PermissionDeniedError,
     authorization_status_label,
@@ -440,6 +443,11 @@ class RemindersStore:
         # the capability check that keeps an OS change from half-applying
         # a write. Reading does not depend on this.
         self._tag_writer = RemindersTagWriter()
+        # Linked content — the Mail / Messages chip — is the same story:
+        # invisible to EventKit, read from the store file, written through
+        # ReminderKit. See linkstore.py and linkwriter.py.
+        self._links = RemindersLinkStore()
+        self._link_writer = RemindersLinkWriter()
 
         self._ensure_access()
         self._refresh_lists()
@@ -835,6 +843,7 @@ class RemindersStore:
         ]
 
         tags, tags_reason = self._real_tags_for(summary.id)
+        link, link_reason = self._link_for(summary.id)
 
         return ReminderDetail(
             **summary.model_dump(),
@@ -849,6 +858,8 @@ class RemindersStore:
             tags=tags,
             tags_unavailable_reason=tags_reason,
             text_hashtags=text_hashtags,
+            link=link,
+            link_unavailable_reason=link_reason,
             creation_date=_ns_date_to_datetime(r.creationDate()),
             modification_date=_ns_date_to_datetime(r.lastModifiedDate()),
         )
@@ -908,6 +919,55 @@ class RemindersStore:
         detail.tags = tags
         detail.tags_unavailable_reason = None
         return detail
+
+    # Linked content -----------------------------------------------------
+
+    def _link_for(
+        self, reminder_id: str
+    ) -> tuple[Optional[LinkedContent], Optional[str]]:
+        """Read one reminder's linked content (the Mail / Messages chip).
+
+        Returns (link, None) on success — link being None when the reminder
+        simply has none — or (None, reason) when the store is unreadable.
+        """
+        try:
+            return self._links.link_for_reminder(reminder_id), None
+        except LinkStoreError as exc:
+            logger.warning("Linked content unavailable: %s", exc)
+            return None, str(exc)
+
+    def link_writes_unavailable_reason(self) -> Optional[str]:
+        """Why linked-content writes would fail, or None when they work."""
+        return self._link_writer.unavailable_reason()
+
+    def _detail_after_link_write(
+        self, reminder_id: str, link: Optional[LinkedContent]
+    ) -> ReminderDetail:
+        """Rebuild a reminder's detail after ReminderKit changed its link.
+
+        `link` comes from the writer's own read-back, for the same reason
+        _detail_after_tag_write trusts the writer over the store file.
+        """
+        self._refresh_eventkit()
+        r = self._lookup_reminder(reminder_id)
+        if r is None:
+            raise ValueError(f"Reminder not found: {reminder_id}")
+        detail = self._to_detail(r)
+        detail.link = link
+        detail.link_unavailable_reason = None
+        return detail
+
+    def set_link(
+        self, reminder_id: str, link: str, title: Optional[str] = None
+    ) -> ReminderDetail:
+        """Attach linked content, replacing any existing chip."""
+        result = self._link_writer.set_link(reminder_id, link, title)
+        return self._detail_after_link_write(reminder_id, result)
+
+    def clear_link(self, reminder_id: str) -> ReminderDetail:
+        """Remove linked content. No-op when there is none."""
+        self._link_writer.clear_link(reminder_id)
+        return self._detail_after_link_write(reminder_id, None)
 
     def add_tags(self, reminder_id: str, tags: list[str]) -> ReminderDetail:
         """Add real tags to a reminder. Already-present tags are skipped."""
@@ -1141,9 +1201,15 @@ class RemindersStore:
         location: Optional[LocationSpec] = None,
         parent_id: Optional[str] = None,
         tags: Optional[list[str]] = None,
+        link: Optional[str] = None,
+        link_title: Optional[str] = None,
     ) -> ReminderDetail:
         if not title or not title.strip():
             raise ValueError("Reminder title must be a non-empty string.")
+        if link is not None and link.strip():
+            # Fail on a malformed link *before* creating anything: this is
+            # the one link error that is the caller's, not the machine's.
+            parse_link(link, link_title)
         if priority not in _PRIORITY_VALID:
             raise ValueError(f"priority must be one of {sorted(_PRIORITY_VALID)}")
 
@@ -1209,25 +1275,55 @@ class RemindersStore:
         ident = str(r.calendarItemIdentifier())
         self._reminders_by_id[ident] = r
 
+        # The reminder exists at this point. Tags and linked content are
+        # further, independent writes through ReminderKit, so if either
+        # fails the reminder still stands — say so in the detail rather
+        # than raising, which would imply nothing was created.
+        tags_applied: Optional[list[str]] = None
+        tags_reason: Optional[str] = None
         if tags:
-            # The reminder exists at this point. Tagging is a second,
-            # independent write through ReminderKit, so if it fails the
-            # reminder still stands — say so in the detail rather than
-            # raising, which would imply nothing was created.
             try:
-                applied = self._tag_writer.add_tags(ident, tags)
-                return self._detail_after_tag_write(ident, applied)
+                tags_applied = self._tag_writer.add_tags(ident, tags)
             except (TagWriteError, ValueError) as exc:
                 logger.warning("Reminder %s created but not tagged: %s",
                                ident, exc)
-                detail = self._to_detail(r)
-                detail.tags_unavailable_reason = (
+                tags_reason = (
                     f"Reminder was created, but its tags were not applied: "
                     f"{exc}"
                 )
-                return detail
 
-        return self._to_detail(r)
+        link_applied: Optional[LinkedContent] = None
+        link_reason: Optional[str] = None
+        if link is not None and link.strip():
+            try:
+                link_applied = self._link_writer.set_link(ident, link, link_title)
+            except (LinkWriteError, ValueError) as exc:
+                logger.warning("Reminder %s created but not linked: %s",
+                               ident, exc)
+                link_reason = (
+                    f"Reminder was created, but its linked content was not "
+                    f"applied: {exc}"
+                )
+
+        if tags_applied is None and link_applied is None:
+            detail = self._to_detail(r)
+        else:
+            # A ReminderKit save bumped the modification date; rebuild
+            # from a refreshed EventKit so the detail reflects it.
+            self._refresh_eventkit()
+            fresh = self._lookup_reminder(ident)
+            detail = self._to_detail(fresh if fresh is not None else r)
+        if tags_applied is not None:
+            detail.tags = tags_applied
+            detail.tags_unavailable_reason = None
+        if tags_reason is not None:
+            detail.tags_unavailable_reason = tags_reason
+        if link_applied is not None:
+            detail.link = link_applied
+            detail.link_unavailable_reason = None
+        if link_reason is not None:
+            detail.link_unavailable_reason = link_reason
+        return detail
 
     def update_reminder(
         self,

@@ -35,6 +35,10 @@ Reminders — tags (write)
   remove_reminder_tags     - Remove real tags from a reminder
   set_reminder_tags        - Replace a reminder's tags outright
 
+Reminders — linked content (write)
+  set_reminder_link        - Attach the Mail / Messages chip to a reminder
+  clear_reminder_link      - Remove it
+
 Tags
 ----
 Real tags — the chips you see on a reminder in Reminders.app — are NOT
@@ -51,6 +55,16 @@ Writing tags is a separate capability from reading them: reads come from
 the store file (Full Disk Access), writes go through Apple's private
 ReminderKit framework (Reminders permission). Either can be unavailable
 on its own, and each reports its own reason.
+
+Linked content
+--------------
+The Mail / Messages chip on a reminder — what Siri's "remind me about
+this" and the share sheet attach — is likewise invisible to EventKit. It
+is NOT the `url` field, which Reminders.app never shows. It is read from
+the store (`link`, null with `link_unavailable_reason` when unreadable)
+and written through ReminderKit (`set_reminder_link`, `clear_reminder_link`,
+and a `link` argument on `create_reminder`). Messages links are
+chat-level: Messages.app has no per-message deep link.
 
 Reminders — write
   create_reminder          - Create with full property set (recurrence, alarms, location, parent)
@@ -116,7 +130,9 @@ mcp = MCPServer(
         "Access to Apple Reminders on this Mac via EventKit. "
         "You can list and manage reminder lists; create, search, update, "
         "complete, and delete reminders; and work with subtasks, "
-        "recurrence, alarms, and locations."
+        "recurrence, alarms, and locations. Reminders can carry real Apple "
+        "tags and linked content (the Mail / Messages chip that opens the "
+        "source email or chat)."
     ),
     version=__version__,
 )
@@ -158,6 +174,13 @@ def _require_tag_writes(store) -> None:
     reason = store.tag_writes_unavailable_reason()
     if reason is not None:
         raise RuntimeError(f"Cannot write Apple Reminders tags: {reason}")
+
+
+def _require_link_writes(store) -> None:
+    """Fail early, and with a reason, when linked content cannot be written."""
+    reason = store.link_writes_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(f"Cannot set linked content on reminders: {reason}")
 
 
 def _parse_iso(s: Optional[str], field: str) -> Optional[datetime]:
@@ -341,13 +364,20 @@ def search_reminders(
 def get_reminder(reminder_id: str) -> ReminderDetail:
     """Fetch one reminder with all properties.
 
-    Includes notes, recurrence, alarms, location, subtasks, and real tags.
+    Includes notes, recurrence, alarms, location, subtasks, real tags, and
+    linked content.
 
     `tags` holds genuine Apple Reminders tags. It is null (not empty) when
     the local store could not be read, with the reason in
     `tags_unavailable_reason`. `text_hashtags` is a separate, purely
     textual scrape of "#tokens" from the title and notes — those are not
     tags and never were.
+
+    `link` is the reminder's linked content — the Mail / Messages chip —
+    with `kind` (mail / messages / web / other), `url`, and for Messages
+    the chat `title`. Null with `link_unavailable_reason` set means the
+    store could not be read; null with no reason means there is no link.
+    This is distinct from `url`, which Reminders.app never displays.
 
     Args:
         reminder_id: Identifier from list_reminders / search_reminders.
@@ -451,6 +481,63 @@ def set_reminder_tags(reminder_id: str, tags: list[str]) -> ReminderResult:
 
 
 @mcp.tool()
+def set_reminder_link(
+    reminder_id: str,
+    link: str,
+    title: Optional[str] = None,
+) -> ReminderResult:
+    """Attach linked content to a reminder — the Mail / Messages chip.
+
+    This is the chip Reminders.app shows under a reminder made with Siri
+    ("remind me about this") or the share sheet; tapping it opens the
+    source. It is NOT the `url` field, which Reminders.app never displays.
+    Any existing linked content is replaced.
+
+    Accepted `link` values:
+      - Mail: a message URL, `message://<Message-ID>` or `message:<Message-ID>`
+        (the Mail connector's `mail_link` works as-is). Renders the Mail chip.
+      - Messages: a chat guid as the Messages connector reports it —
+        `any;-;+15551234567` for a 1:1 chat, `any;+;chat123…` for a group —
+        or a `messages://open?…` URL. Renders the Messages chip. Links are
+        chat-level; Messages.app has no per-message deep link.
+      - Web: an `http://` or `https://` URL.
+
+    Uses Apple's private ReminderKit framework (no supported API can set
+    this), so it can stop working after a macOS update — in which case it
+    raises with a clear reason rather than silently doing nothing.
+
+    Args:
+        reminder_id: Identifier from list_reminders / search_reminders.
+        link:        See above.
+        title:       Label for a Messages link — normally the chat's display
+                     name or the contact's name. Defaults to the identifier.
+                     Ignored for Mail and web links.
+    """
+    if not link or not link.strip():
+        raise ValueError("`link` must be a non-empty string.")
+    store = _require_store()
+    _require_link_writes(store)
+    return ReminderResult(
+        reminder=store.set_link(reminder_id, link, title), success=True
+    )
+
+
+@mcp.tool()
+def clear_reminder_link(reminder_id: str) -> ReminderResult:
+    """Remove a reminder's linked content (the Mail / Messages chip).
+
+    A reminder with no linked content is left untouched. Does not affect
+    the separate `url` field; use update_reminder with clear_url for that.
+
+    Args:
+        reminder_id: Identifier from list_reminders / search_reminders.
+    """
+    store = _require_store()
+    _require_link_writes(store)
+    return ReminderResult(reminder=store.clear_link(reminder_id), success=True)
+
+
+@mcp.tool()
 def list_subtasks(reminder_id: str) -> list[ReminderSummary]:
     """List the immediate subtasks (child reminders) of a parent reminder.
 
@@ -479,6 +566,8 @@ def create_reminder(
     location: Optional[LocationSpec] = None,
     parent_id: Optional[str] = None,
     tags: Optional[list[str]] = None,
+    link: Optional[str] = None,
+    link_title: Optional[str] = None,
 ) -> ReminderResult:
     """Create a new reminder with rich properties.
 
@@ -501,6 +590,15 @@ def create_reminder(
                      reminder is created; if that step fails the reminder
                      still exists and the reason is reported in
                      `tags_unavailable_reason`.
+        link:        Linked content — the Mail / Messages chip. A Mail
+                     message URL (`message://<Message-ID>`), a Messages
+                     chat guid (`any;-;+15551234567`, `any;+;chat123…`),
+                     or an http(s) URL; see set_reminder_link. Applied
+                     after creation; if that step fails the reminder still
+                     exists and the reason is in `link_unavailable_reason`.
+                     A malformed value is rejected before anything is
+                     created. Distinct from `url`, which the app never shows.
+        link_title:  Label for a Messages link (chat or contact name).
     """
     if priority not in (0, 1, 5, 9):
         raise ValueError("priority must be one of 0, 1, 5, 9.")
@@ -521,6 +619,8 @@ def create_reminder(
         location=location,
         parent_id=parent_id,
         tags=tags,
+        link=link,
+        link_title=link_title,
     )
     return ReminderResult(reminder=detail, success=True)
 

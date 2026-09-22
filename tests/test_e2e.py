@@ -4,14 +4,17 @@ End-to-end tests for the Apple Reminders MCP connector.
 Tests are split into two groups:
 
   Group A — Static tests (no Reminders permission required)
-    Pydantic model shapes, input validation, hashtag parsing, and the
-    tag-store reader against a synthetic fixture store.
+    Pydantic model shapes, input validation, hashtag parsing, the
+    tag-store reader against a synthetic fixture store, link parsing,
+    and the linked-content decoder against archives built the way
+    Reminders builds them.
     Always run.
 
   Group C — Live local Reminders store (requires Full Disk Access)
-    Reads the real Reminders Core Data store to check real-tag reading
-    and the real-tag / text-hashtag split. Needs no Reminders TCC grant,
-    only file access. Skipped with a clear message when unreadable.
+    Reads the real Reminders Core Data store to check real-tag reading,
+    the real-tag / text-hashtag split, and that every linked-content
+    chip in the store decodes. Needs no Reminders TCC grant, only file
+    access. Skipped with a clear message when unreadable.
 
   Group B — Live EventKit tests (requires Reminders access)
     Operate against a dedicated test list named ``__claude_mcp_test__``,
@@ -308,7 +311,8 @@ def t_manifest_matches_tools():
             f"manifest lists {name} but server.py has no such tool",
         )
     for name in ("add_reminder_tags", "remove_reminder_tags",
-                 "set_reminder_tags", "list_tags"):
+                 "set_reminder_tags", "list_tags",
+                 "set_reminder_link", "clear_reminder_link"):
         is_in(name, listed, f"{name} is not advertised in manifest.json")
 
 
@@ -771,6 +775,300 @@ def t_tag_read_write_separate():
     )
 
 
+@test("A", "linked content model shape")
+def t_link_model_shape():
+    from apple_reminders_mcp.models import LinkedContent, ReminderDetail
+
+    rd = ReminderDetail(id="x", list_id="l", list_title="Errands", title="t")
+    # Same convention as tags: None + no reason == "no link", not "unknown".
+    eq(rd.link, None)
+    eq(rd.link_unavailable_reason, None)
+    lc = LinkedContent(kind="mail", url="message:%3Ca@b%3E")
+    eq(lc.title, None)
+    eq(lc.activity_type, None)
+    try:
+        LinkedContent(kind="carrier-pigeon", url="x")
+    except Exception:
+        pass
+    else:
+        raise AssertionError("LinkedContent accepted an unknown kind")
+
+
+@test("A", "link parsing canonicalises Mail, Messages, and web links")
+def t_link_parsing():
+    from apple_reminders_mcp.linkwriter import parse_link
+
+    # Every spelling of a Mail link lands on Apple's own: message:%3C…%3E
+    apple = "message:%3Cabc+d_e=f@host.example%3E"
+    for form in (
+        "message:%3Cabc+d_e=f@host.example%3E",           # Apple's spelling
+        "message://%3Cabc+d_e=f%40host.example%3E",       # Mail connector's mail_link
+        "message://<abc+d_e=f@host.example>",
+        "message:<abc+d_e=f@host.example>",
+        "<abc+d_e=f@host.example>",
+        "  message://<abc+d_e=f@host.example>  ",
+    ):
+        spec = parse_link(form)
+        eq(spec.kind, "mail", form)
+        eq(spec.url, apple, form)
+        eq(spec.title, None, "Mail links carry no title")
+
+    # Messages: chat guids as the Messages connector reports them.
+    spec = parse_link("any;+;chat656905820623768966", "Arcadia Survivors")
+    eq(spec.kind, "messages")
+    eq(spec.url, "messages://open?groupid=chat656905820623768966")
+    eq(spec.title, "Arcadia Survivors")
+    spec = parse_link("iMessage;-;+15551234567")
+    eq(spec.url, "messages://open?addresses=+15551234567")
+    eq(spec.title, "+15551234567", "1:1 title defaults to the handle")
+    eq(parse_link("SMS;-;+15551234567").url, "messages://open?addresses=+15551234567")
+    eq(parse_link("any;-;someone@example.com").url,
+       "messages://open?addresses=someone@example.com")
+    eq(parse_link("chat123").url, "messages://open?groupid=chat123")
+    eq(parse_link("+15551234567").url, "messages://open?addresses=+15551234567")
+    eq(parse_link("imessage://+15551234567").url, "messages://open?addresses=+15551234567")
+    eq(parse_link("messages://open?groupid=chat1").url, "messages://open?groupid=chat1")
+
+    spec = parse_link("https://example.com/a?b=c", "ignored?")
+    eq(spec.kind, "web")
+    eq(spec.url, "https://example.com/a?b=c")
+
+    for bad in ("", "   ", "hello", "mailto:a@b.c", "brad@example.com", "ftp://x"):
+        try:
+            parse_link(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"parse_link accepted {bad!r}")
+
+
+@test("A", "linked-content decoder reads Apple's archive shapes")
+def t_link_decoder():
+    """Two on-disk shapes, both seen in real stores on 2026-09-21.
+
+    Apple archives `type` / `storage` / `flags` straight into $top; the
+    storage is raw bytes on some rows and an NSMutableData object on
+    others. The user-activity form nests a second keyed archive.
+    """
+    import plistlib
+
+    from apple_reminders_mcp.linkstore import decode_user_activity
+
+    # Universal link, raw-bytes storage, fields in $top (rows 105/108/3615).
+    raw = plistlib.dumps({
+        "$version": 100000, "$archiver": "NSKeyedArchiver",
+        "$top": {"type": 1, "storage": plistlib.UID(1)},
+        "$objects": ["$null", b"message:%3Cabc@host.example%3E"],
+    }, fmt=plistlib.FMT_BINARY)
+    link = decode_user_activity(raw)
+    not_none(link)
+    eq(link.kind, "mail")
+    eq(link.url, "message:%3Cabc@host.example%3E")
+    eq(link.title, None)
+
+    # Universal link, NSMutableData storage (row 2080), plus flags.
+    wrapped = plistlib.dumps({
+        "$version": 100000, "$archiver": "NSKeyedArchiver",
+        "$top": {"type": 1, "storage": plistlib.UID(1), "flags": 0},
+        "$objects": [
+            "$null",
+            {"$class": plistlib.UID(2), "NS.data": b"https://example.com/x"},
+            {"$classname": "NSMutableData", "$classes": ["NSMutableData", "NSData", "NSObject"]},
+        ],
+    }, fmt=plistlib.FMT_BINARY)
+    eq(decode_user_activity(wrapped).kind, "web")
+    eq(decode_user_activity(wrapped).url, "https://example.com/x")
+
+    # NSUserActivity form (row 4935): a nested keyed archive.
+    inner = plistlib.dumps({
+        "$version": 100000, "$archiver": "NSKeyedArchiver",
+        "$top": {"root": plistlib.UID(1)},
+        "$objects": [
+            "$null",
+            {"$class": plistlib.UID(5), "activityType": plistlib.UID(2),
+             "title": plistlib.UID(3), "targetContentIdentifier": plistlib.UID(4),
+             "type": 1, "version": 1},
+            "com.apple.Messages",
+            "Arcadia Survivors",
+            "messages://open?groupid=chat656905820623768966",
+            {"$classname": "UAUserActivityInfo", "$classes": ["UAUserActivityInfo", "NSObject"]},
+        ],
+    }, fmt=plistlib.FMT_BINARY)
+    outer = plistlib.dumps({
+        "$version": 100000, "$archiver": "NSKeyedArchiver",
+        "$top": {"type": 2, "storage": plistlib.UID(1), "flags": 0},
+        "$objects": ["$null", inner],
+    }, fmt=plistlib.FMT_BINARY)
+    link = decode_user_activity(outer)
+    not_none(link)
+    eq(link.kind, "messages")
+    eq(link.url, "messages://open?groupid=chat656905820623768966")
+    eq(link.title, "Arcadia Survivors")
+    eq(link.activity_type, "com.apple.Messages")
+
+    # XML-format archive (row 2080): references are {"CF$UID": n} dicts.
+    # (plistlib's XML writer has no UID support, so spell them as Apple does.)
+    xml = plistlib.dumps({
+        "$version": 100000, "$archiver": "NSKeyedArchiver",
+        "$top": {"type": 1, "storage": {"CF$UID": 1}},
+        "$objects": [
+            "$null",
+            {"$class": {"CF$UID": 2}, "NS.data": b"message:%3Cxml@host.example%3E"},
+            {"$classname": "NSMutableData", "$classes": ["NSMutableData", "NSData", "NSObject"]},
+        ],
+    }, fmt=plistlib.FMT_XML)
+    is_in(b"CF$UID", xml, "fixture did not produce an XML-style reference")
+    link = decode_user_activity(xml)
+    not_none(link, "XML-format archive did not decode")
+    eq(link.url, "message:%3Cxml@host.example%3E")
+
+    # Garbage must read as "no link", never raise.
+    eq(decode_user_activity(None), None)
+    eq(decode_user_activity(b""), None)
+    eq(decode_user_activity(b"not a plist"), None)
+
+
+@test("A", "link writer's own archive decodes like Apple's")
+def t_link_writer_archive_matches():
+    """Build the activities the writer would save and decode them with the
+    store reader — the two halves must agree before any live write."""
+    from apple_reminders_mcp.linkstore import decode_user_activity
+    from apple_reminders_mcp.linkwriter import RemindersLinkWriter, parse_link
+
+    w = RemindersLinkWriter()
+    reason = w.unavailable_reason()
+    if reason is not None and "does not appear to provide" in reason:
+        skip(f"ReminderKit unavailable on this macOS: {reason}")
+    eq(reason, None, "ReminderKit no longer matches what the link writer calls")
+
+    from Foundation import NSKeyedArchiver
+
+    def archived(spec):
+        activity = w._make_activity(spec)
+        data, err = NSKeyedArchiver.archivedDataWithRootObject_requiringSecureCoding_error_(
+            activity, True, None
+        )
+        not_none(data, f"could not archive {spec}: {err}")
+        return activity, bytes(data)
+
+    activity, data = archived(parse_link("message://%3Ca%40b.example%3E"))
+    eq(int(activity.type()), 1, "a Mail link must be a universal-link activity")
+    link = decode_user_activity(data)
+    eq(link.kind, "mail")
+    eq(link.url, "message:%3Ca@b.example%3E")
+    eq(w._linked_from_activity(activity), link, "writer and reader disagree")
+
+    activity, data = archived(parse_link("any;+;chat42", "Family"))
+    eq(int(activity.type()), 2, "a Messages link must wrap an NSUserActivity")
+    link = decode_user_activity(data)
+    eq(link.kind, "messages")
+    eq(link.url, "messages://open?groupid=chat42")
+    eq(link.title, "Family")
+    eq(link.activity_type, "com.apple.Messages")
+    eq(w._linked_from_activity(activity), link, "writer and reader disagree")
+
+
+@test("A", "link writer declares what it needs before using it")
+def t_link_writer_capabilities():
+    import ast
+
+    from apple_reminders_mcp import linkwriter
+
+    src = (ROOT / "src" / "apple_reminders_mcp" / "linkwriter.py").read_text()
+    for cls, sels in linkwriter._REQUIRED.items():
+        truthy(cls.startswith("REM"), f"{cls} is not a ReminderKit class")
+        for sel in sels:
+            is_in(sel, src, f"{cls}.{sel} declared but never called")
+    flat = {sel for sels in linkwriter._REQUIRED.values() for sel in sels}
+    for needed in (
+        "initWithUniversalLink_", "initWithUserActivity_",
+        "setUserActivity_", "userActivity", "updateReminder_",
+        "saveSynchronouslyWithError_",
+    ):
+        is_in(needed, flat, f"{needed} is used but not declared in _REQUIRED")
+
+    tree = ast.parse(src)
+    cls_node = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RemindersLinkWriter"
+    )
+    body = ast.get_source_segment(src, cls_node)
+    truthy(
+        body.index("_rem_store()") < body.index("updateReminder_"),
+        "the store (and so the capability check) must be reached before a write",
+    )
+
+
+@test("A", "link writer never falls back to writing the store file")
+def t_link_writer_no_sqlite():
+    src = (ROOT / "src" / "apple_reminders_mcp" / "linkwriter.py").read_text()
+    for forbidden in ("sqlite3", "UPDATE ", "INSERT ", "ZUSERACTIVITY ="):
+        truthy(
+            forbidden not in src,
+            f"linkwriter.py references {forbidden!r} — writes must go "
+            "through ReminderKit only",
+        )
+    src = (ROOT / "src" / "apple_reminders_mcp" / "linkstore.py").read_text()
+    for forbidden in ("INSERT", "UPDATE", "DELETE", "mode=rw", "mode=rwc"):
+        truthy(forbidden not in src, f"linkstore.py contains {forbidden!r} — it must never write")
+    is_in("mode=ro", src)
+    is_in("query_only", src)
+
+
+@test("A", "link write tools refuse cleanly when unavailable")
+def t_link_write_guard():
+    from apple_reminders_mcp import server
+
+    class _Store:
+        def link_writes_unavailable_reason(self):
+            return "ReminderKit moved"
+
+    try:
+        server._require_link_writes(_Store())
+    except RuntimeError as exc:
+        is_in("ReminderKit moved", str(exc))
+    else:
+        raise AssertionError("_require_link_writes did not raise")
+
+    class _OkStore:
+        def link_writes_unavailable_reason(self):
+            return None
+
+    server._require_link_writes(_OkStore())
+
+
+@test("A", "link reads and writes are separate; create survives a failed link")
+def t_link_read_write_separate():
+    import ast
+
+    src = (ROOT / "src" / "apple_reminders_mcp" / "reminders.py").read_text()
+    tree = ast.parse(src)
+    cls_node = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RemindersStore"
+    )
+    fns = {
+        n.name: ast.get_source_segment(src, n)
+        for n in cls_node.body if isinstance(n, ast.FunctionDef)
+    }
+    is_in("self._links.", fns["_link_for"])
+    is_in("self._link_writer.", fns["link_writes_unavailable_reason"])
+    is_in("_link_for", fns["_to_detail"], "_to_detail does not consult the link store")
+
+    create = fns["create_reminder"]
+    is_in("link_unavailable_reason", create)
+    # A malformed link is the caller's error and must fail before creation…
+    truthy(create.index("parse_link(") < create.index("saveReminder_commit_error_"))
+    # …but once the reminder exists, a failed *write* must not claim the
+    # reminder failed. (EventKit's own save failure, just above, may raise.)
+    after_save = create.split("ident = str(r.calendarItemIdentifier())")[1]
+    truthy(
+        "raise" not in after_save.split("return detail")[0],
+        "a failed link write raises out of create_reminder, which would "
+        "imply the reminder was not created",
+    )
+
+
 @test("A", "tag writer loads ReminderKit on this machine")
 def t_tag_writer_loads():
     """Not a live write — just that the private API still matches.
@@ -1029,6 +1327,59 @@ def t_real_tags_vs_text():
         f"{len(false_negatives)} invisible to the text scrape, "
         f"{len(false_positives)} '#text' reminders with no matching real tag)"
     )
+
+
+@test("C", "every linked-content chip in the live store decodes")
+def t_real_links_live():
+    """Whatever Siri and the share sheet have written on this Mac must
+    read back as a Mail, Messages, or other link — never as garbage."""
+    from apple_reminders_mcp.linkstore import RemindersLinkStore
+
+    ls = RemindersLinkStore()
+    reason = ls.unavailable_reason()
+    if reason is not None:
+        skip(f"Local Reminders store unreadable: {reason}")
+
+    import sqlite3
+
+    # Distinct *live* reminder ids, not rows: a reminder that moved between
+    # accounts lingers, marked for deletion, in the old account's store.
+    raw_ids: set[str] = set()
+    for path in ls.store_paths():
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            cols = {r[1] for r in con.execute("PRAGMA table_info(ZREMCDREMINDER)")}
+            live = (" AND (ZMARKEDFORDELETION IS NULL OR ZMARKEDFORDELETION = 0)"
+                    if "ZMARKEDFORDELETION" in cols else "")
+            raw_ids.update(
+                row[0] for row in con.execute(
+                    "SELECT upper(ZDACALENDARITEMUNIQUEIDENTIFIER) FROM ZREMCDREMINDER "
+                    "WHERE ZUSERACTIVITY IS NOT NULL "
+                    "AND ZDACALENDARITEMUNIQUEIDENTIFIER IS NOT NULL" + live
+                )
+            )
+            con.close()
+        except sqlite3.Error as exc:
+            skip(f"Could not count linked reminders: {exc}")
+
+    links = ls.all_links()
+    if not links:
+        skip("No linked reminders in the live store to decode")
+    eq(set(links), raw_ids, "some ZUSERACTIVITY blobs did not decode")
+    kinds = {}
+    for rid, link in links.items():
+        eq(len(rid), 36, f"{rid!r} is not a dashed UUID")
+        is_in(link.kind, ("mail", "messages", "web", "other"))
+        kinds[link.kind] = kinds.get(link.kind, 0) + 1
+        if link.kind == "mail":
+            truthy(link.url.startswith("message:"), link.url)
+        if link.kind == "messages":
+            truthy(link.url.startswith("messages://"), link.url)
+            eq(link.activity_type, "com.apple.Messages")
+        # Round-trip through the single-reminder path.
+        eq(ls.link_for_reminder(rid), link)
+        eq(ls.link_for_reminder(rid.lower()), link, "id lookup must be case-insensitive")
+    print(f"      (live store: {len(links)} linked reminders — {kinds})")
 
 
 # ---------------------------------------------------------------------------
@@ -1495,6 +1846,125 @@ def t_tag_filter_live():
     detail = store.get_reminder(decoy.id)
     eq(detail.tags, [])
     eq(detail.text_hashtags, ["zztest-filter"])
+
+
+@test("B", "linked content write round-trip")
+def t_link_write_round_trip():
+    """Set / replace / clear the Mail and Messages chip on a throwaway
+    reminder, confirming each step against the store file as well as
+    against ReminderKit's own read-back."""
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+    reason = store.link_writes_unavailable_reason()
+    if reason is not None:
+        skip(f"Link writes unavailable: {reason}")
+
+    from apple_reminders_mcp.linkstore import RemindersLinkStore, decode_user_activity
+
+    fresh = RemindersLinkStore()
+    if fresh.unavailable_reason() is not None:
+        skip("Full Disk Access needed to verify link writes independently")
+
+    item = store.create_reminder(title="zzlinkwrite subject", list_id=list_id)
+    _track(item.id)
+    eq(item.link, None, "a new reminder should start with no linked content")
+    eq(item.link_unavailable_reason, None)
+
+    def from_store():
+        # A new reader each time: nothing may be served from a cache.
+        return RemindersLinkStore().link_for_reminder(item.id)
+
+    # --- Mail chip, from the Mail connector's own mail_link spelling -------
+    detail = store.set_link(item.id, "message://%3Czztest%40example.mail%3E")
+    not_none(detail.link)
+    eq(detail.link.kind, "mail")
+    eq(detail.link.url, "message:%3Czztest@example.mail%3E")
+    eq(detail.link_unavailable_reason, None)
+    stored = from_store()
+    eq(stored, detail.link, "Mail link did not reach the Reminders store")
+    # And the on-disk archive has Apple's shape: type 1, storage = the URL.
+    blob = RemindersLinkStore().raw_user_activity(item.id)
+    not_none(blob)
+    is_in(b"message:%3Czztest@example.mail%3E", blob)
+    eq(decode_user_activity(blob), detail.link)
+
+    # Setting the same link again is a no-op (no save, no churn).
+    before_mod = store.get_reminder(item.id).modification_date
+    detail = store.set_link(item.id, "message:%3Czztest@example.mail%3E")
+    eq(detail.link.url, "message:%3Czztest@example.mail%3E")
+    eq(store.get_reminder(item.id).modification_date, before_mod,
+       "a no-change set_link saved anyway")
+
+    # --- Replace with a Messages chip --------------------------------------
+    detail = store.set_link(item.id, "any;+;chat1234567890", "zztest group")
+    eq(detail.link.kind, "messages")
+    eq(detail.link.url, "messages://open?groupid=chat1234567890")
+    eq(detail.link.title, "zztest group")
+    eq(detail.link.activity_type, "com.apple.Messages")
+    eq(from_store(), detail.link, "Messages link did not reach the Reminders store")
+
+    detail = store.set_link(item.id, "any;-;+15551234567", "zztest person")
+    eq(detail.link.url, "messages://open?addresses=+15551234567")
+    eq(from_store().title, "zztest person")
+
+    # --- get_reminder reads it back from the store ---------------------------
+    fetched = store.get_reminder(item.id)
+    eq(fetched.link, detail.link)
+    eq(fetched.link_unavailable_reason, None)
+
+    # --- Clear -------------------------------------------------------------
+    detail = store.clear_link(item.id)
+    eq(detail.link, None)
+    eq(detail.link_unavailable_reason, None)
+    eq(from_store(), None, "linked content was not cleared in the Reminders store")
+    # Clearing again is a no-op, not an error.
+    eq(store.clear_link(item.id).link, None)
+
+
+@test("B", "create_reminder applies linked content")
+def t_create_with_link():
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+    if store.link_writes_unavailable_reason() is not None:
+        skip("Link writes unavailable")
+
+    item = store.create_reminder(
+        title="zzlinkcreate subject", list_id=list_id,
+        link="message://%3Czzcreate%40example.mail%3E",
+    )
+    _track(item.id)
+    not_none(item.link)
+    eq(item.link.kind, "mail")
+    eq(item.link.url, "message:%3Czzcreate@example.mail%3E")
+    eq(item.link_unavailable_reason, None)
+    # `url` is a different field and must stay untouched.
+    eq(item.url, None)
+
+    from apple_reminders_mcp.linkstore import RemindersLinkStore
+    if RemindersLinkStore().unavailable_reason() is None:
+        eq(RemindersLinkStore().link_for_reminder(item.id), item.link)
+
+    # Tags and link together, in one call.
+    if store.tag_writes_unavailable_reason() is None:
+        both = store.create_reminder(
+            title="zzlinkcreate both", list_id=list_id,
+            tags=["zztest-link"], link="any;+;chat42", link_title="zztest chat",
+        )
+        _track(both.id)
+        eq(both.tags, ["zztest-link"])
+        eq(both.link.kind, "messages")
+        eq(both.link.title, "zztest chat")
+
+    # A malformed link fails before anything is created.
+    n_before = len(store.list_reminders(list_ids=[list_id], limit=500).reminders)
+    try:
+        store.create_reminder(title="zzlinkcreate bad", list_id=list_id, link="nonsense")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("create_reminder accepted a malformed link")
+    eq(len(store.list_reminders(list_ids=[list_id], limit=500).reminders), n_before,
+       "a reminder was created despite the malformed link")
 
 
 # ---------------------------------------------------------------------------

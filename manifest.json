@@ -4,9 +4,9 @@
 
   "name": "apple-reminders",
   "display_name": "Apple Reminders",
-  "version": "0.2.1",
-  "description": "Access Apple Reminders on macOS via EventKit — search, create, update, complete, and delete reminders with full support for subtasks, recurrence, alarms, and locations.",
-  "long_description": "Connects Claude to Apple Reminders on your Mac via Apple's first-class EventKit framework. Full read+write coverage of the Reminders data model.\n\n**Features:**\n- Browse all reminder lists across all accounts (iCloud, Local, CalDAV, Exchange)\n- Search reminders by free text, list, completion, due date, priority\n- Create reminders with notes, URL, due/start dates, and priority\n- Recurrence rules — daily/weekly/monthly/yearly, with intervals, by-day/by-month, end date or count\n- Alarms — relative offset, absolute date, or location-based geofence (enter/leave)\n- Subtasks — create child reminders, list children, cascade delete\n- Mark reminders complete or uncomplete\n- Manage reminder lists themselves — create, rename, recolor, delete\n- Deep-link any reminder via x-apple-reminderkit:// URL\n- Read AND write real Apple Reminders tags — the chips shown in Reminders.app — add, remove, replace, and filter by them\n\n**Requirements:**\n- macOS 14 Sonoma or later\n- Reminders permission (System Settings → Privacy & Security → Reminders)\n- Full Disk Access, for reading real tags only (everything else works without it)\n\n**Note on tags:** Apple exposes no API for Reminders tags. Reading them means reading the Reminders app's own database; writing them uses Apple's private ReminderKit framework. Both are documented in the README, and tag writing may break on a future macOS release — it will say so plainly rather than fail silently.",
+  "version": "0.3.0",
+  "description": "Access Apple Reminders on macOS via EventKit — search, create, update, complete, and delete reminders with full support for subtasks, recurrence, alarms, locations, real tags, and Mail / Messages linked content.",
+  "long_description": "Connects Claude to Apple Reminders on your Mac via Apple's first-class EventKit framework. Full read+write coverage of the Reminders data model.\n\n**Features:**\n- Browse all reminder lists across all accounts (iCloud, Local, CalDAV, Exchange)\n- Search reminders by free text, list, completion, due date, priority\n- Create reminders with notes, URL, due/start dates, and priority\n- Recurrence rules — daily/weekly/monthly/yearly, with intervals, by-day/by-month, end date or count\n- Alarms — relative offset, absolute date, or location-based geofence (enter/leave)\n- Subtasks — create child reminders, list children, cascade delete\n- Mark reminders complete or uncomplete\n- Manage reminder lists themselves — create, rename, recolor, delete\n- Deep-link any reminder via x-apple-reminderkit:// URL\n- Read AND write real Apple Reminders tags — the chips shown in Reminders.app — add, remove, replace, and filter by them\n- Read AND write linked content — the Mail / Messages chip that opens the source email or chat, as Siri's \"remind me about this\" creates\n\n**Requirements:**\n- macOS 14 Sonoma or later\n- Reminders permission (System Settings → Privacy & Security → Reminders)\n- Full Disk Access, for reading real tags and linked content only (everything else works without it)\n\n**Note on tags and linked content:** Apple exposes no API for Reminders tags or for the Mail / Messages chip. Reading them means reading the Reminders app's own database; writing them uses Apple's private ReminderKit framework. Both are documented in the README, and either write path may break on a future macOS release — it will say so plainly rather than fail silently. Messages links are chat-level: Messages.app has no per-message deep link.",
 
   "author": {
     "name": "Brad"
@@ -37,20 +37,22 @@
     { "name": "get_stats",             "description": "Aggregate counts: list count, total reminders, incomplete, completed, overdue, due today" },
     { "name": "list_reminders",        "description": "List reminders in one or more lists, with filters: completed, priority, due_before/after, has_subtasks, text, tags" },
     { "name": "search_reminders",      "description": "Free-text search across reminder titles and notes, with filters for list, completion, priority, due date, and tags" },
-    { "name": "get_reminder",          "description": "Full detail for a reminder — notes, URL, recurrence, alarms, location, subtask ids, real tags, timestamps" },
+    { "name": "get_reminder",          "description": "Full detail for a reminder — notes, URL, recurrence, alarms, location, subtask ids, real tags, linked content, timestamps" },
     { "name": "get_reminder_link",     "description": "Get an x-apple-reminderkit:// URL that opens the reminder in Reminders.app" },
     { "name": "list_subtasks",         "description": "List the immediate subtasks (child reminders) of a parent reminder" },
     { "name": "list_tags",             "description": "List every real Apple Reminders tag with the number of reminders using it" },
     { "name": "add_reminder_tags",     "description": "Add real Apple tags to a reminder (creates tags that do not exist yet; idempotent)" },
     { "name": "remove_reminder_tags",  "description": "Remove real Apple tags from a reminder" },
     { "name": "set_reminder_tags",     "description": "Replace a reminder's real Apple tags with exactly the given set; empty list clears them" },
-    { "name": "create_reminder",       "description": "Create a reminder with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks), real tags" },
+    { "name": "set_reminder_link",     "description": "Attach linked content — the Mail / Messages chip that opens a source email or chat — from a message:// URL, a Messages chat guid, or an http(s) URL" },
+    { "name": "clear_reminder_link",   "description": "Remove a reminder's linked content (the Mail / Messages chip)" },
+    { "name": "create_reminder",       "description": "Create a reminder with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks), real tags, linked content" },
     { "name": "update_reminder",       "description": "Update any subset of a reminder's properties; explicit clear_* flags remove fields" },
     { "name": "complete_reminder",     "description": "Mark a reminder as complete or uncomplete (or toggle if completed is null)" },
     { "name": "delete_reminder",       "description": "Delete a reminder; cascades to subtasks by default" }
   ],
 
-  "keywords": ["apple", "reminders", "tasks", "todo", "macos", "subtasks", "recurrence", "geofence", "eventkit", "tags"],
+  "keywords": ["apple", "reminders", "tasks", "todo", "macos", "subtasks", "recurrence", "geofence", "eventkit", "tags", "mail", "messages", "deep-link"],
   "license": "MIT",
 
   "compatibility": {

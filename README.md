@@ -1,6 +1,6 @@
 # Apple Reminders MCP
 
-A Claude Desktop extension that gives **Claude full access to Apple Reminders** on macOS via Apple's first-class **EventKit** framework. Read, create, update, complete, and delete reminders — including subtasks, recurrence rules, alarms, and location-based geofences.
+A Claude Desktop extension that gives **Claude full access to Apple Reminders** on macOS via Apple's first-class **EventKit** framework. Read, create, update, complete, and delete reminders — including subtasks, recurrence rules, alarms, location-based geofences, real tags, and the Mail / Messages chip that links a reminder to its source email or chat.
 
 Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/12922929-building-desktop-extensions-with-mcpb) with the Reminders.app icon and one-click install.
 
@@ -17,14 +17,16 @@ Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/1
 | `get_stats` | Aggregate counts: list count, total, incomplete, completed, overdue, due today |
 | `list_reminders` | Reminders in one or more lists with filters: completed, priority, due date, has-subtasks, text, tags |
 | `search_reminders` | Free-text search across title and notes, with the same filters |
-| `get_reminder` | Full detail — notes, URL, recurrence, alarms, location, subtask ids, real tags, timestamps |
+| `get_reminder` | Full detail — notes, URL, recurrence, alarms, location, subtask ids, real tags, linked content, timestamps |
 | `get_reminder_link` | `x-apple-reminderkit://` URL to open the reminder in Reminders.app |
 | `list_subtasks` | Immediate children of a parent reminder |
 | `list_tags` | Every real Apple Reminders tag, with how many reminders carry it |
 | `add_reminder_tags` | Add real tags to a reminder (idempotent; creates new tags) |
 | `remove_reminder_tags` | Remove real tags from a reminder |
 | `set_reminder_tags` | Replace a reminder's tags outright; empty list clears them |
-| `create_reminder` | Create with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks), real tags |
+| `set_reminder_link` | Attach linked content — the Mail / Messages chip — from a `message://` URL, a Messages chat guid, or an `https://` URL |
+| `clear_reminder_link` | Remove a reminder's linked content |
+| `create_reminder` | Create with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks), real tags, linked content |
 | `update_reminder` | Update any subset of properties; `clear_*` flags explicitly remove fields |
 | `complete_reminder` | Mark complete or uncomplete (or toggle if `completed` is null) |
 | `delete_reminder` | Delete a reminder; cascades to subtasks by default |
@@ -135,6 +137,81 @@ Behaviour worth knowing:
 
 ---
 
+## Linked content
+
+Make a reminder with Siri ("remind me about this email") or from the
+share sheet, and Reminders.app shows a chip under the title — the Mail
+icon with the message's subject, or the Messages icon with the chat's
+name. Tap it and the source opens. That chip is the reminder's **linked
+content**, and this connector can read it and write it.
+
+It is **not** the reminder's `url` field. EventKit's `URL` lands in the
+store's `ZICSURL` column, which Reminders.app never draws — a `message://`
+URL there opens Mail fine from a script, but nobody can see or click it.
+`url` is left alone; linked content is a separate thing.
+
+### What it is on disk
+
+A `REMUserActivity`, archived with `NSKeyedArchiver` into
+`ZREMCDREMINDER.ZUSERACTIVITY`. Two shapes, both decoded from real rows:
+
+| Chip | Activity `type` | Payload |
+|---|---|---|
+| **Mail** | 1 (universal link) | the bare Message-ID URL, `message:%3C<id>%3E` — note `message:` with no `//` |
+| **Messages** | 2 (user activity) | a nested archive of an `NSUserActivity`: `activityType` = `com.apple.Messages`, `title` = chat name, `targetContentIdentifier` = `messages://open?groupid=chat…` |
+
+Even Apple's own Messages chip is **chat-level**. There is no per-message
+deep link into Messages.app, so a reminder about an iMessage opens the
+conversation, not the message.
+
+### Reading
+
+`get_reminder` reports `link` with `kind` (`mail`, `messages`, `web`, or
+`other` for an activity from some other app, such as Notes), `url`, and
+for Messages the chat `title`. Same convention as `tags`: `link: null`
+with `link_unavailable_reason` set means the store could not be read
+(Full Disk Access again); `null` with no reason means there is simply no
+link. The reader is read-only and needs no private API.
+
+### Writing
+
+`set_reminder_link`, `clear_reminder_link`, and a `link` argument on
+`create_reminder` (with `link_title` for Messages). Accepted values:
+
+| You pass | It becomes |
+|---|---|
+| `message://<Message-ID>` or `message:<Message-ID>`, brackets literal or percent-encoded — the Mail connector's `mail_link` works as-is | the **Mail** chip. Canonicalised to Apple's own spelling, `message:%3C<id>%3E`; both spellings open the message in Mail.app |
+| a chat guid as the Messages connector reports it: `any;-;+15551234567` (1:1) or `any;+;chat123…` (group); also `iMessage;…` / `SMS;…`, a bare `chat123…`, a bare `+1555…`, or a ready `messages://open?…` URL | the **Messages** chip. Groups → `messages://open?groupid=chat…` (the form Messages itself writes); 1:1 → `messages://open?addresses=<handle>`. Verified against Messages.app: `groupid=chat…` opens the group, `addresses=<handle>` (and `groupid=<handle>`) opens the 1:1 chat |
+| `http://` or `https://` | a universal-link chip |
+
+A malformed `link` on `create_reminder` is rejected before anything is
+created. A link that parses but fails to *write* leaves the reminder in
+place and reports why in `link_unavailable_reason`, exactly like `tags`.
+Setting the link a reminder already has is a no-op and does not save.
+
+**This uses private API, deliberately** — the same `ReminderKit` route as
+[writing tags](#writing-tags), for the same reason: nothing supported can
+set it. Only Siri and the share sheet write linked content, and they go
+through ReminderKit.
+
+```
+REMStore.fetchReminderWithDACalendarItemUniqueIdentifier:inList:error:
+REMUserActivity initWithUniversalLink:        (Mail, web)
+REMUserActivity initWithUserActivity:         (Messages, wrapping an NSUserActivity)
+REMSaveRequest(store).updateReminder:         -> REMReminderChangeItem
+  .setUserActivity:                           (forwarded to its REMReminderStorage)
+REMSaveRequest.saveSynchronouslyWithError:
+```
+
+Every class and selector is declared and verified before anything is
+touched; if a macOS update moves the interface the tools refuse with a
+message naming what went missing. Writing needs **Reminders permission**;
+reading needs **Full Disk Access**. The archive the writer produces was
+checked byte-for-shape against Apple's own rows, and the store reader
+decodes it identically.
+
+---
+
 ## Requirements
 
 - macOS 14 Sonoma or later (`requestFullAccessToReminders` was added in 14)
@@ -142,7 +219,8 @@ Behaviour worth knowing:
 - Claude Desktop with extension support
 - Reminders permission granted to Claude Desktop (see below)
 - Full Disk Access for Claude Desktop — **only** needed to read real
-  tags; every other tool works without it (see [Tags](#tags))
+  tags and linked content; every other tool works without it (see
+  [Tags](#tags) and [Linked content](#linked-content))
 
 ---
 
@@ -212,6 +290,7 @@ Once installed, just ask Claude naturally:
 - *"Remind me to take out the trash every Sunday at 8am."*
 - *"Mark my 'Pay rent' reminder complete."*
 - *"What's tagged #urgent that's still incomplete?"*
+- *"Make a reminder to reply to that email, linked to it so I can open it from Reminders."*
 - *"Add a reminder to call mom when I leave the office (geofence at 37.7749, -122.4194)."*
 
 ---
@@ -254,6 +333,8 @@ apple-reminders-mcp/
         ├── reminders.py             # EventKit-backed RemindersStore
         ├── tagstore.py              # Read-only reader for real tags
         ├── tagwriter.py             # Tag writes via private ReminderKit
+        ├── linkstore.py             # Read-only reader + decoder for linked content
+        ├── linkwriter.py            # Linked-content writes via private ReminderKit
         ├── permissions.py           # TCC grant helpers
         └── models.py                # Pydantic data models
 ```
@@ -261,12 +342,13 @@ apple-reminders-mcp/
 ### Tests
 
 ```bash
-# Static tests — model shapes, validation, helpers, and the tag reader
-# against a synthetic fixture store. No permissions needed.
+# Static tests — model shapes, validation, helpers, the tag reader against
+# a synthetic fixture store, link parsing, and the linked-content decoder
+# against archives shaped like Apple's. No permissions needed.
 uv run python tests/test_e2e.py --skip-live
 
 # Full suite (requires Reminders permission, and Full Disk Access for the
-# tag tests)
+# tag and linked-content tests)
 uv run python tests/test_e2e.py
 ```
 
@@ -275,8 +357,11 @@ Three groups:
 - **A — static.** Always runs. Includes the tag store exercised against a
   generated fixture that reproduces the awkward parts of the real schema:
   a per-store entity id, the shared wide object table, soft-deleted rows.
+  Also builds the linked-content activities the writer would save and
+  checks the store reader decodes them to the same thing.
 - **C — live local store.** Reads the real Reminders store; needs Full Disk
   Access but *not* Reminders permission. Skipped with a reason otherwise.
+  Includes decoding every Mail / Messages chip already in the store.
 - **B — live EventKit.** Operates against a dedicated `__claude_mcp_test__`
   list, created at setup and torn down at the end. Needs Reminders
   permission, which a plain shell does not have — run these through the
@@ -313,12 +398,13 @@ For comparison, the same operations via AppleScript would take 5–30 seconds.
 - [x] Subtasks (parent/child)
 - [x] Real Apple Reminders tags — read, enumerate, filter by, and write them
 - [x] `x-apple-reminderkit://` deep links
+- [x] Linked content — the Mail / Messages chip — read and write
 
 **v2 — under consideration**
 - [ ] Smart lists (today, scheduled, all, completed, flagged)
 - [ ] Shared list write-back (currently best-effort; depends on CalDAV permissions)
 - [ ] Bulk operations (delete multiple, complete multiple, move multiple)
-- [ ] Public tags API if Apple ships one — would let the write path drop private ReminderKit
+- [ ] Public tags / linked-content API if Apple ships one — would let both write paths drop private ReminderKit
 
 
 ---
