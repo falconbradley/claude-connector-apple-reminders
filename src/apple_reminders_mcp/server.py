@@ -374,8 +374,8 @@ def list_tags() -> list[TagInfo]:
     """List every real Apple Reminders tag, with how many reminders use it.
 
     These are the tags shown as chips on a reminder and in the Reminders.app
-    sidebar. Includes tags that exist but are not currently applied to any
-    reminder (count 0), since the app still offers those when filtering.
+    sidebar. In practice every tag reports at least one reminder: Reminders
+    deletes a label as soon as nothing references it.
 
     Reads the Reminders app's own store, which needs Full Disk Access for
     the host process; without it this raises rather than returning [].
@@ -416,9 +416,9 @@ def add_reminder_tags(reminder_id: str, tags: list[str]) -> ReminderResult:
 def remove_reminder_tags(reminder_id: str, tags: list[str]) -> ReminderResult:
     """Remove real Apple tags from a reminder.
 
-    Names not currently on the reminder are ignored. Removing a tag from
-    its last reminder does not delete the tag itself — Reminders keeps
-    the label, exactly as it does when you do this in the app.
+    Names not currently on the reminder are ignored. Removing the last
+    reminder that carries a tag also removes the tag itself: Reminders
+    garbage-collects a label once nothing references it.
 
     Args:
         reminder_id: Identifier from list_reminders / search_reminders.

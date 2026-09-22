@@ -124,8 +124,12 @@ Behaviour worth knowing:
 - Removing a tag that is not present is a no-op, not an error.
 - `set_reminder_tags` diffs rather than clear-and-re-add, so tags that
   should stay are never briefly removed.
-- Removing a tag from its last reminder does not delete the tag itself —
-  Reminders keeps the label, exactly as it does in the app.
+- Removing a tag from its last reminder **does** delete the tag itself.
+  Reminders garbage-collects a label once nothing references it — verified
+  by watching the `ZREMCDHASHTAGLABEL` rows disappear after the last
+  reminder carrying them was untagged. So `list_tags` will in practice
+  never report a tag with `reminder_count: 0`, even though it is written
+  to handle one.
 - A no-change call does not save, so it will not bump the reminder's
   modification date or wake CloudKit.
 

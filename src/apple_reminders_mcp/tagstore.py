@@ -371,10 +371,12 @@ class RemindersTagStore:
     def list_tags(self) -> list[TagInfo]:
         """Every tag in every account, with how many reminders carry it.
 
-        Includes tags the user created that are not currently applied to
-        anything: Reminders keeps the label row, and the app still offers
-        such a tag in its filter UI, so hiding it here would misrepresent
-        what exists.
+        Label rows with no remaining references are included if they ever
+        occur, but in practice they do not: Reminders garbage-collects a
+        label as soon as the last reminder carrying it is untagged. The
+        handling is kept because it costs nothing and the alternative —
+        assuming every label is referenced — would be an assumption about
+        someone else's daemon.
         """
         counts: dict[str, dict[str, Any]] = {}
 
