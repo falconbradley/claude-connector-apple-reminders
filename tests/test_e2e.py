@@ -316,6 +316,81 @@ def t_manifest_matches_tools():
         is_in(name, listed, f"{name} is not advertised in manifest.json")
 
 
+@test("A", "tool schema advertises optional params by type")
+def t_optional_params_typed():
+    """Every optional argument must carry a top-level `type`.
+
+    Pydantic spells `Optional[str] = None` as `anyOf: [string, null]`, and
+    Claude Desktop keeps only a property's top-level `type` and `default`
+    when it hands the schema to the model. That shape therefore reached
+    the model as a bare `{"default": null}`, and a digits-only label such
+    as an SMS shortcode was sent as a JSON integer and refused.
+    """
+    import asyncio
+    import json
+
+    from apple_reminders_mcp import server
+
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+    link_props = tools["set_reminder_link"].input_schema["properties"]
+    eq(link_props["title"].get("type"), "string", "set_reminder_link.title has no type")
+    eq(link_props["title"].get("default"), None)
+    eq(link_props["link"].get("type"), "string")
+    create_props = tools["create_reminder"].input_schema["properties"]
+    for name in ("link_title", "notes", "url", "list_id", "due_date", "parent_id"):
+        eq(create_props[name].get("type"), "string", f"create_reminder.{name} has no type")
+    eq(create_props["alarms"].get("type"), "array")
+    eq(create_props["tags"].get("type"), "array")
+    # The pattern is fixed once, for every tool.
+    for name, tool in tools.items():
+        truthy("anyOf" not in json.dumps(tool.input_schema),
+               f"{name} still advertises a nullable parameter as anyOf")
+
+
+@test("A", "digits-only free text is accepted as a string")
+def t_numeric_text_coerced():
+    """A client that ignores the schema may still send 42878 as an integer.
+    Free-text fields store its digits; a boolean is not text and stays
+    refused."""
+    from pydantic import ValidationError
+
+    from apple_reminders_mcp import server
+
+    def validate(tool: str, args: dict) -> dict:
+        meta = server.mcp._tool_manager.get_tool(tool).fn_metadata
+        return meta.arg_model.model_validate(meta.pre_parse_json(args)).model_dump()
+
+    got = validate("set_reminder_link",
+                   {"reminder_id": "r", "link": "any;-;42878", "title": 42878})
+    eq(got["title"], "42878")
+    got = validate("create_reminder",
+                   {"title": 2026, "notes": 12.5, "link": "any;-;42878", "link_title": 42878})
+    eq(got["title"], "2026")
+    eq(got["notes"], "12.5")
+    eq(got["link_title"], "42878")
+    got = validate("update_reminder", {"reminder_id": "r", "title": 7, "notes": 8})
+    eq((got["title"], got["notes"]), ("7", "8"))
+    eq(validate("search_reminders", {"query": 42878})["query"], "42878")
+    eq(validate("list_reminders", {"text": 42878})["text"], "42878")
+    eq(validate("create_reminder_list", {"title": 2026})["title"], "2026")
+    # A string that happens to be digits is stored verbatim, quotes and all
+    # would have been the workaround; there must be none to strip.
+    eq(validate("set_reminder_link",
+                {"reminder_id": "r", "link": "any;-;42878", "title": "42878"})["title"],
+       "42878")
+    # Explicit null is still "no label".
+    eq(validate("set_reminder_link",
+                {"reminder_id": "r", "link": "any;-;42878", "title": None})["title"], None)
+    for tool, args in (("set_reminder_link", {"reminder_id": "r", "link": "l", "title": True}),
+                       ("create_reminder", {"title": False})):
+        try:
+            validate(tool, args)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError(f"{tool} accepted a boolean as text")
+
+
 @test("A", "reminder link helper")
 def t_reminder_link():
     from apple_reminders_mcp.reminders import _make_reminder_link
@@ -1919,6 +1994,54 @@ def t_link_write_round_trip():
     eq(from_store(), None, "linked content was not cleared in the Reminders store")
     # Clearing again is a no-op, not an error.
     eq(store.clear_link(item.id).link, None)
+
+
+@test("B", "set_reminder_link stores a numeric label as its digits")
+def t_link_numeric_title_live():
+    """The 2026-09-22 failure: an SMS shortcode chat (`any;-;42878`) whose
+    label is the shortcode itself. Goes through the MCP tool layer, not
+    the store, because that is where the integer was refused."""
+    import asyncio
+
+    from apple_reminders_mcp import server
+
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+    if store.link_writes_unavailable_reason() is not None:
+        skip(f"Link writes unavailable: {store.link_writes_unavailable_reason()}")
+
+    # Share the test's store: EventKit rations EKEventStore instances.
+    server._store = store
+    item = store.create_reminder(title="zzlink shortcode", list_id=list_id)
+    _track(item.id)
+
+    def via_tool(title):
+        # The same entry point a client's request reaches, schema
+        # validation included.
+        return asyncio.run(server.mcp.call_tool(
+            "set_reminder_link",
+            {"reminder_id": item.id, "link": "any;-;42878", "title": title},
+        ))
+
+    # As a string, the way a schema-respecting client sends it.
+    via_tool("42878")
+    detail = store.get_reminder(item.id)
+    not_none(detail.link)
+    eq(detail.link.kind, "messages")
+    eq(detail.link.url, "messages://open?addresses=42878")
+    eq(detail.link.title, "42878", "label must be the digits, no quotes")
+
+    # As an integer, the way the failing client sent it.
+    store.clear_link(item.id)
+    via_tool(42878)
+    detail = store.get_reminder(item.id)
+    not_none(detail.link)
+    eq(detail.link.title, "42878", "integer label was not stored as its digits")
+
+    from apple_reminders_mcp.linkstore import RemindersLinkStore
+    if RemindersLinkStore().unavailable_reason() is None:
+        eq(RemindersLinkStore().link_for_reminder(item.id).title, "42878",
+           "numeric label did not reach the Reminders store")
 
 
 @test("B", "create_reminder applies linked content")

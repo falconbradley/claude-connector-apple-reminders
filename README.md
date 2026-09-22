@@ -184,6 +184,10 @@ link. The reader is read-only and needs no private API.
 | a chat guid as the Messages connector reports it: `any;-;+15551234567` (1:1) or `any;+;chat123…` (group); also `iMessage;…` / `SMS;…`, a bare `chat123…`, a bare `+1555…`, or a ready `messages://open?…` URL | the **Messages** chip. Groups → `messages://open?groupid=chat…` (the form Messages itself writes); 1:1 → `messages://open?addresses=<handle>`. Verified against Messages.app: `groupid=chat…` opens the group, `addresses=<handle>` (and `groupid=<handle>`) opens the 1:1 chat |
 | `http://` or `https://` | a universal-link chip |
 
+A numeric label — `title` here, `link_title` on `create_reminder` — is
+accepted as a string, so an SMS shortcode chat such as `any;-;42878` can
+be labelled `42878` without quoting it (quotes would end up in the chip).
+
 A malformed `link` on `create_reminder` is rejected before anything is
 created. A link that parses but fails to *write* leaves the reminder in
 place and reports why in `link_unavailable_reason`, exactly like `tags`.

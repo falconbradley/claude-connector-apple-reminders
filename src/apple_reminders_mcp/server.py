@@ -78,9 +78,10 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import datetime
-from typing import Optional
+from typing import Annotated, Any, Optional
 
 from mcp.server import MCPServer
+from pydantic import Field
 
 from . import __version__
 from .models import (
@@ -183,6 +184,16 @@ def _require_link_writes(store) -> None:
         raise RuntimeError(f"Cannot set linked content on reminders: {reason}")
 
 
+# Free text a person might type. Clients read the tool schema, and the
+# schema alone cannot make a client send a digits-only label as a string:
+# a Messages SMS shortcode such as 42878 has arrived as a JSON integer and
+# been refused as "not a valid string", while quoting it stored the quotes
+# in the chip label. So every field that carries a title, a note, or a
+# search phrase accepts a number and stores its digits. Booleans are
+# still refused; `true` is never a title.
+Text = Annotated[str, Field(coerce_numbers_to_str=True)]
+
+
 def _parse_iso(s: Optional[str], field: str) -> Optional[datetime]:
     if s is None:
         return None
@@ -208,7 +219,7 @@ def list_reminder_lists() -> list[ReminderList]:
 
 @mcp.tool()
 def create_reminder_list(
-    title: str,
+    title: Text,
     color: Optional[str] = None,
     source_name: Optional[str] = None,
 ) -> ListResult:
@@ -226,7 +237,7 @@ def create_reminder_list(
 @mcp.tool()
 def update_reminder_list(
     list_id: str,
-    title: Optional[str] = None,
+    title: Optional[Text] = None,
     color: Optional[str] = None,
 ) -> ListResult:
     """Rename or recolor a reminder list.
@@ -272,7 +283,7 @@ def list_reminders(
     due_before: Optional[str] = None,
     due_after: Optional[str] = None,
     has_subtasks: Optional[bool] = None,
-    text: Optional[str] = None,
+    text: Optional[Text] = None,
     tags: Optional[list[str]] = None,
     match_all_tags: bool = False,
     limit: int = 50,
@@ -315,7 +326,7 @@ def list_reminders(
 
 @mcp.tool()
 def search_reminders(
-    query: str,
+    query: Text,
     list_ids: Optional[list[str]] = None,
     completed: Optional[bool] = None,
     priority: Optional[int] = None,
@@ -484,7 +495,7 @@ def set_reminder_tags(reminder_id: str, tags: list[str]) -> ReminderResult:
 def set_reminder_link(
     reminder_id: str,
     link: str,
-    title: Optional[str] = None,
+    title: Optional[Text] = None,
 ) -> ReminderResult:
     """Attach linked content to a reminder — the Mail / Messages chip.
 
@@ -511,7 +522,8 @@ def set_reminder_link(
         link:        See above.
         title:       Label for a Messages link — normally the chat's display
                      name or the contact's name. Defaults to the identifier.
-                     Ignored for Mail and web links.
+                     A number (an SMS shortcode such as 42878) is stored as
+                     its digits. Ignored for Mail and web links.
     """
     if not link or not link.strip():
         raise ValueError("`link` must be a non-empty string.")
@@ -553,9 +565,9 @@ def list_subtasks(reminder_id: str) -> list[ReminderSummary]:
 
 @mcp.tool()
 def create_reminder(
-    title: str,
+    title: Text,
     list_id: Optional[str] = None,
-    notes: Optional[str] = None,
+    notes: Optional[Text] = None,
     url: Optional[str] = None,
     due_date: Optional[str] = None,
     is_all_day: bool = False,
@@ -567,7 +579,7 @@ def create_reminder(
     parent_id: Optional[str] = None,
     tags: Optional[list[str]] = None,
     link: Optional[str] = None,
-    link_title: Optional[str] = None,
+    link_title: Optional[Text] = None,
 ) -> ReminderResult:
     """Create a new reminder with rich properties.
 
@@ -598,7 +610,8 @@ def create_reminder(
                      exists and the reason is in `link_unavailable_reason`.
                      A malformed value is rejected before anything is
                      created. Distinct from `url`, which the app never shows.
-        link_title:  Label for a Messages link (chat or contact name).
+        link_title:  Label for a Messages link (chat or contact name). A
+                     number, such as an SMS shortcode, is stored as its digits.
     """
     if priority not in (0, 1, 5, 9):
         raise ValueError("priority must be one of 0, 1, 5, 9.")
@@ -628,8 +641,8 @@ def create_reminder(
 @mcp.tool()
 def update_reminder(
     reminder_id: str,
-    title: Optional[str] = None,
-    notes: Optional[str] = None,
+    title: Optional[Text] = None,
+    notes: Optional[Text] = None,
     url: Optional[str] = None,
     list_id: Optional[str] = None,
     due_date: Optional[str] = None,
@@ -722,6 +735,45 @@ def delete_reminder(
                      subtasks are orphaned (their parent_id will become null).
     """
     return _require_store().delete_reminder(reminder_id, cascade=cascade)
+
+
+# ---------------------------------------------------------------------------
+# Tool schema: advertise nullable parameters by their type
+# ---------------------------------------------------------------------------
+
+def _flatten_nullable(schema: Any) -> Any:
+    """Rewrite `anyOf: [T, {"type": "null"}]` as `T`, recursively.
+
+    Pydantic describes `Optional[str] = None` as an `anyOf` of a string
+    and a null. Claude Desktop keeps only a property's top-level `type`
+    and `default` when it hands the schema to the model, so that shape
+    reaches the model as a bare `{"default": null}` — no type at all —
+    and a digits-only value is sent as a JSON integer, while a required
+    `link: str` arrives typed and is sent as a string. Advertising the
+    non-null branch directly gives every optional parameter a type the
+    client keeps. The server still accepts an explicit null: this only
+    changes what is advertised, not what pydantic validates.
+    """
+    if isinstance(schema, list):
+        return [_flatten_nullable(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    options = schema.get("anyOf")
+    if isinstance(options, list):
+        non_null = [o for o in options if o != {"type": "null"}]
+        if len(non_null) == 1 and len(non_null) < len(options):
+            merged = dict(non_null[0])
+            merged.update({k: v for k, v in schema.items() if k != "anyOf"})
+            return _flatten_nullable(merged)
+    return {k: _flatten_nullable(v) for k, v in schema.items()}
+
+
+def _advertise_nullable_params_by_type() -> None:
+    for tool in mcp._tool_manager.list_tools():
+        tool.parameters = _flatten_nullable(tool.parameters)
+
+
+_advertise_nullable_params_by_type()
 
 
 # ---------------------------------------------------------------------------
