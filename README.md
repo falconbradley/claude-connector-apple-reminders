@@ -212,7 +212,10 @@ touched; if a macOS update moves the interface the tools refuse with a
 message naming what went missing. Writing needs **Reminders permission**;
 reading needs **Full Disk Access**. The archive the writer produces was
 checked byte-for-shape against Apple's own rows, and the store reader
-decodes it identically.
+decodes it identically. The full round trip was verified live on
+2026-09-22 through the installed connector: both chips render in
+Reminders.app exactly like Siri's, clicking the Mail chip opens the
+email in Mail.app, and clicking the Messages chip opens the chat.
 
 ---
 
