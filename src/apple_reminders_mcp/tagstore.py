@@ -82,6 +82,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .models import TagInfo
+from .launcher import full_disk_access_steps
 
 logger = logging.getLogger("apple_reminders_mcp.tagstore")
 
@@ -168,9 +169,9 @@ class RemindersTagStore:
         except TagStoreError as exc:
             return str(exc)
         return (
-            f"No readable Reminders store found under {self._dir}. Is "
-            "Reminders set up on this Mac, and does the host process have "
-            "Full Disk Access?"
+            f"No readable Reminders store found under {self._dir}. Either "
+            "Reminders is not set up on this Mac, or the extension lacks "
+            "Full Disk Access.\n\n" + full_disk_access_steps()
         )
 
     def _usable_stores(self) -> list[tuple[sqlite3.Connection, dict[str, Any]]]:
@@ -221,8 +222,8 @@ class RemindersTagStore:
         except sqlite3.Error as exc:
             raise TagStoreError(
                 f"Could not open {path.name} read-only: {exc}. This usually "
-                "means the host process is missing Full Disk Access — see "
-                "the README."
+                "means the extension is missing Full Disk Access.\n\n"
+                + full_disk_access_steps()
             ) from exc
         cache[str(path)] = con
         return con

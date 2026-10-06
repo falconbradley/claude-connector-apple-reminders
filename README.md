@@ -62,7 +62,7 @@ with one SQLite file per account. It is opened strictly read-only
 (`mode=ro` plus `PRAGMA query_only`) and never written; Reminders.app stays
 the only writer and the only sync engine.
 
-**This needs Full Disk Access** for the host process (Claude Desktop), since
+**This needs Full Disk Access** for the extension's `uv` (see [Permissions](#permissions)), since
 Group Containers are TCC-protected. Everything else in the connector works
 without it. When the store cannot be read, `get_reminder` returns
 `tags: null` with a `tags_unavailable_reason` explaining why — deliberately
@@ -224,8 +224,8 @@ email in Mail.app, and clicking the Messages chip opens the chat.
 - macOS 14 Sonoma or later (`requestFullAccessToReminders` was added in 14)
 - Python 3.11+
 - Claude Desktop with extension support
-- Reminders permission granted to Claude Desktop (see below)
-- Full Disk Access for Claude Desktop — **only** needed to read real
+- Reminders permission granted to the extension's `uv` (see [Permissions](#permissions))
+- Full Disk Access for the same `uv` — **only** needed to read real
   tags and linked content; every other tool works without it (see
   [Tags](#tags) and [Linked content](#linked-content))
 
@@ -271,8 +271,10 @@ The first time Claude calls a Reminders tool, macOS will prompt you to grant **R
 If the prompt doesn't appear (which can happen with unsigned interpreters launched as child processes):
 
 1. Open **System Settings → Privacy & Security → Reminders**
-2. Add Claude Desktop (or whichever process is running `uv`) and enable it
-3. Quit and relaunch Claude Desktop
+2. Enable **uv** — not Claude. Claude Desktop launches extension servers through a helper that makes the spawned `uv` (`~/Library/Application Support/Claude/uv-runtime/<version>/uv`) responsible for their permissions. The connector's permission error prints the exact path.
+3. Quit Claude (⌘Q) and reopen it
+
+**Full Disk Access** (only for tags and linked content): System Settings → Privacy & Security → Full Disk Access → **+**, press ⌘⇧G, and paste the same `uv` path — `get_reminder`'s `tags_unavailable_reason` prints it. Then quit Claude (⌘Q) and reopen it; macOS reads this permission only at launch.
 
 To verify access status, run:
 
@@ -281,7 +283,17 @@ sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
   "SELECT client, auth_value FROM access WHERE service='kTCCServiceReminders'"
 ```
 
-(`auth_value` of `2` = full access, `0` = denied.)
+(`auth_value` of `2` = full access, `0` = denied. The client is the `uv` path, not Claude. Reading `TCC.db` itself needs Full Disk Access for your terminal.)
+
+### Using several Apple connectors
+
+This connector is one of a family of Claude Desktop extensions for Apple apps — [Mail](https://github.com/falconbradley/claude-connector-apple-mail), [Messages](https://github.com/falconbradley/claude-connector-apple-messages), [Contacts](https://github.com/falconbradley/claude-connector-apple-contacts), [Calendar](https://github.com/falconbradley/claude-connector-apple-calendar), **Reminders**, [Notes](https://github.com/falconbradley/claude-connector-apple-notes) — and they share the same setup quirks:
+
+- **Install them one at a time.** Opening several `.mcpb` files at once can leave Claude Desktop showing only the last install dialog, so the others silently never install. Approve each dialog before opening the next, then check **Settings → Extensions**.
+- **Permissions belong to `uv`, not Claude.** Claude Desktop launches every extension through the same bundled `uv` and macOS attributes their privacy grants to it. Full Disk Access granted once to `~/Library/Application Support/Claude/uv-runtime/<version>/uv` covers Mail, Notes, Messages, and Reminders together; the Contacts, Calendars, and Reminders panes list the connectors as **uv**. Permission errors print the exact path in use, ready to paste.
+- **Re-grant after Claude Desktop updates `uv`.** The `<version>` folder changes and macOS treats the new binary as a new app. Symptoms: Mail and Notes searches report `"engine": "applescript"` and get slow, Messages reads and Reminders tags fail with a Full Disk Access error.
+- **Restart after granting.** Quit Claude (⌘Q) and reopen it — macOS reads Full Disk Access only at launch.
+- **Verify.** Ask Claude for each connector's stats (`get_stats`). For Mail and Notes, a search result's `engine` should be `"sqlite"`.
 
 ---
 
@@ -444,6 +456,16 @@ EventKit silently rejects some illegal combinations (e.g. `days_of_month` on a w
 Make sure you're running a recent Claude Desktop that supports MCPB extensions. Restart Claude Desktop after installing.
 
 ---
+
+## Releasing
+
+Every connector in the family releases the same way:
+
+1. Bump the version in `pyproject.toml`, `manifest.json`, and `src/apple_reminders_mcp/__init__.py`, then run `uv lock` so `uv.lock` matches. CI fails if the three disagree.
+2. Add a section for the version to [CHANGELOG.md](CHANGELOG.md).
+3. Commit, tag `vX.Y.Z`, and push the tag: `git push origin main vX.Y.Z`.
+
+The [release workflow](.github/workflows/release.yml) then runs the tests, checks the tag matches all three version files, builds with `./build.sh`, and publishes `apple-reminders.mcpb` and `apple-reminders-X.Y.Z.mcpb` to a GitHub release whose notes are that version's CHANGELOG section.
 
 ## License
 
