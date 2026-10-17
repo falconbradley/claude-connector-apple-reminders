@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote, unquote
 
+from .launcher import privacy_pane_steps
 from .linkstore import (
     MESSAGES_ACTIVITY_TYPE,
     TYPE_UNIVERSAL_LINK,
@@ -125,7 +126,7 @@ class LinkWriteUnavailable(LinkWriteError):
     """The write path itself is unusable on this machine.
 
     Either ReminderKit could not be loaded / no longer matches what we
-    call, or the host process lacks Reminders permission.
+    call, or the extension's ``uv`` lacks Reminders permission.
     """
 
 
@@ -361,10 +362,9 @@ class RemindersLinkWriter:
             code = int(error.code()) if hasattr(error, "code") else 0
             if code == _XPC_CONNECTION_INVALID:
                 raise LinkWriteUnavailable(
-                    "Could not reach the Reminders daemon (remindd). The "
-                    "host process almost certainly lacks Reminders "
-                    "permission — grant it under System Settings → Privacy "
-                    f"& Security → Reminders. ({domain} {code})"
+                    "Could not reach the Reminders daemon (remindd): the "
+                    "extension almost certainly lacks Reminders permission "
+                    f"({domain} {code}).\n\n" + privacy_pane_steps("Reminders")
                 )
             raise LinkWriteError(f"Could not load reminder {reminder_id}: {error}")
         raise LinkWriteError(f"Reminder not found: {reminder_id}")
@@ -502,7 +502,8 @@ class RemindersLinkWriter:
                 if int(error.code()) == _XPC_CONNECTION_INVALID:
                     raise LinkWriteUnavailable(
                         "Could not reach the Reminders daemon (remindd) to "
-                        "save. The host process lacks Reminders permission."
+                        "save: the extension lacks Reminders permission.\n\n"
+                        + privacy_pane_steps("Reminders")
                     )
             raise LinkWriteError(
                 f"Saving linked content for {reminder_id} failed: "

@@ -542,11 +542,14 @@ For comparison, the same operations via AppleScript would take 5–30 seconds.
 
 ## Troubleshooting
 
-**"Apple Reminders access was not granted"**
-Open **System Settings → Privacy & Security → Reminders**, ensure Claude Desktop is in the list and toggled on, then restart Claude Desktop.
+**"Apple Reminders access was not granted"**, or a tag, link or assignment write saying it could not reach the Reminders daemon
+Open **System Settings → Privacy & Security → Reminders** and enable **uv**, not Claude. The error prints the exact `uv` path. Then quit Claude (⌘Q) and reopen it. See [Permissions](#permissions).
 
 **Permission prompt doesn't appear**
-Unsigned Python interpreters launched by Claude Desktop sometimes don't trigger the prompt automatically. Add Claude Desktop manually under **System Settings → Privacy & Security → Reminders**.
+Claude Desktop launches the server through its bundled `uv`, which sometimes doesn't trigger the prompt. Enable **uv** manually under **System Settings → Privacy & Security → Reminders**, as above.
+
+**Tags, linked content, sharing or assignments come back null with a Full Disk Access reason**
+Grant Full Disk Access to the `uv` path the reason prints, then quit Claude (⌘Q) and reopen it. See [Permissions](#permissions).
 
 **Recurrence rule didn't take effect**
 EventKit silently rejects some illegal combinations (e.g. `days_of_month` on a weekly recurrence). Check the returned `ReminderDetail.recurrence` to see what was actually stored.

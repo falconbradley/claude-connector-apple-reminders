@@ -761,6 +761,56 @@ def t_store_errors_name_uv():
                        f"{cls.__name__} ({where.name}) still says 'host process'")
 
 
+@test("A", "writer permission errors say which uv needs Reminders access")
+def t_writer_errors_name_uv():
+    """remindd refusing the connection means the uv lacks Reminders access.
+
+    Each writer must say so with the exact grant steps, not "the host
+    process", which sends people to Claude in System Settings.
+    """
+    from apple_reminders_mcp.assignwriter import (
+        AssignWriteUnavailable, RemindersAssignWriter,
+    )
+    from apple_reminders_mcp.launcher import privacy_pane_steps
+    from apple_reminders_mcp.linkwriter import LinkWriteUnavailable, RemindersLinkWriter
+    from apple_reminders_mcp.tagwriter import RemindersTagWriter, TagWriteUnavailable
+
+    class _Refused:
+        """The NSError remindd's XPC refusal produces (NSCocoaErrorDomain 4097)."""
+        def domain(self):
+            return "NSCocoaErrorDomain"
+
+        def code(self):
+            return 4097
+
+    class _Store:
+        def fetchReminderWithDACalendarItemUniqueIdentifier_inList_error_(self, *a):
+            return None, _Refused()
+
+    steps = privacy_pane_steps("Reminders")
+    for writer, unavailable in (
+        (RemindersTagWriter(), TagWriteUnavailable),
+        (RemindersLinkWriter(), LinkWriteUnavailable),
+        (RemindersAssignWriter(), AssignWriteUnavailable),
+    ):
+        name = type(writer).__name__
+        try:
+            writer._fetch(_Store(), FIX_A)
+        except unavailable as exc:
+            is_in(steps, str(exc), f"{name} omits the uv steps")
+            is_in("4097", str(exc), f"{name} drops the underlying error code")
+        else:
+            raise AssertionError(f"{name} did not report the refused connection")
+
+    # The save-time refusal is only reachable through a live save, so
+    # check its wording at the source.
+    for module in ("tagwriter", "linkwriter", "assignwriter"):
+        src = (ROOT / "src" / "apple_reminders_mcp" / f"{module}.py").read_text()
+        truthy("host process" not in src, f"{module}.py still says 'host process'")
+        eq(src.count('privacy_pane_steps("Reminders")'), 2,
+           f"{module}.py should give the uv steps on both fetch and save")
+
+
 @test("A", "tag store reports an unreadable store instead of empty tags")
 def t_tagstore_missing():
     import tempfile

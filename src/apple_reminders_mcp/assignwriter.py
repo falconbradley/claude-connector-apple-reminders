@@ -47,6 +47,8 @@ import logging
 import threading
 from typing import Any, Optional
 
+from .launcher import privacy_pane_steps
+
 logger = logging.getLogger("apple_reminders_mcp.assignwriter")
 
 _FRAMEWORK = "/System/Library/PrivateFrameworks/ReminderKit.framework"
@@ -93,7 +95,7 @@ class AssignWriteUnavailable(AssignWriteError):
     """The write path itself is unusable on this machine.
 
     Either ReminderKit could not be loaded / no longer matches what we
-    call, or the host process lacks Reminders permission.
+    call, or the extension's ``uv`` lacks Reminders permission.
     """
 
 
@@ -227,10 +229,9 @@ class RemindersAssignWriter:
         code = int(error.code()) if hasattr(error, "code") else 0
         if code == _XPC_CONNECTION_INVALID:
             raise AssignWriteUnavailable(
-                "Could not reach the Reminders daemon (remindd). The host "
-                "process almost certainly lacks Reminders permission — grant "
-                "it under System Settings → Privacy & Security → Reminders. "
-                f"({domain} {code})"
+                "Could not reach the Reminders daemon (remindd): the "
+                "extension almost certainly lacks Reminders permission "
+                f"({domain} {code}).\n\n" + privacy_pane_steps("Reminders")
             )
         raise AssignWriteError(f"Could not load {what}: {error}")
 
@@ -355,7 +356,8 @@ class RemindersAssignWriter:
                 if int(error.code()) == _XPC_CONNECTION_INVALID:
                     raise AssignWriteUnavailable(
                         "Could not reach the Reminders daemon (remindd) to "
-                        "save. The host process lacks Reminders permission."
+                        "save: the extension lacks Reminders permission.\n\n"
+                        + privacy_pane_steps("Reminders")
                     )
             raise AssignWriteError(
                 f"Saving the assignment for {reminder_id} failed: "

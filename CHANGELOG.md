@@ -16,6 +16,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - **The first tag on an untagged account now shows up without a restart.** The tag reader cached a store's layout even when it had not yet found the column linking tags to reminders, which it can only learn once a tag exists. On a fresh account, or in the on-device store, a newly added tag stayed invisible to `list_tags` and the `tags` filter until the connector restarted.
 - **Linked-content store errors name the `uv` to grant**, as 0.3.2 described but did not fully do. They still told you to give Full Disk Access to "the host process", and so did the tag store's error for when no store exists at all. Every store error now prints the exact `uv` path and the steps to grant it.
+- **Tag, link and assignment writes name the `uv` to grant, too.** When the Reminders daemon refused a write, the error said "the host process lacks Reminders permission". It now prints the same `uv` path and steps as the main permission error.
 
 ## [0.3.3] — 2026-10-06
 
