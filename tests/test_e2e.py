@@ -474,7 +474,9 @@ def t_predicate_selectors_exist():
 # Tag store — synthetic fixture
 # ---------------------------------------------------------------------------
 
-def _build_fixture_store(path: Path, hashtag_ent: int, fk_col: str) -> None:
+def _build_fixture_store(
+    path: Path, hashtag_ent: int, fk_col: str, with_tags: bool = True
+) -> None:
     """Write a miniature Reminders store with the real schema shape.
 
     Only the columns the reader touches are recreated, but the awkward
@@ -482,6 +484,9 @@ def _build_fixture_store(path: Path, hashtag_ent: int, fk_col: str) -> None:
     ZREMCDOBJECT table, its Z_ENT is parameterised (it really does differ
     between the iCloud stores and Data-local.sqlite on one Mac), and the
     reminder foreign key is one of several same-named ZREMINDER* columns.
+
+    with_tags=False leaves out every label and hashtag row, like a fresh
+    account that has never had a tag.
     """
     import sqlite3
 
@@ -514,10 +519,6 @@ def _build_fixture_store(path: Path, hashtag_ent: int, fk_col: str) -> None:
         "INSERT INTO Z_PRIMARYKEY VALUES (?,?,0,0)", (hashtag_ent + 5, "REMCDAlarm")
     )
     con.executemany(
-        "INSERT INTO ZREMCDHASHTAGLABEL VALUES (?,?,?)",
-        [(1, "Buy", "buy"), (2, "autoreview", "autoreview"), (3, "Unused", "unused")],
-    )
-    con.executemany(
         "INSERT INTO ZREMCDREMINDER VALUES (?,?,?,?)",
         [
             (10, "Install dishwasher", 0, FIX_A),
@@ -525,6 +526,14 @@ def _build_fixture_store(path: Path, hashtag_ent: int, fk_col: str) -> None:
             (12, "Plain reminder, no tags", 0, FIX_C),
             (13, "Deleted but still tagged", 1, FIX_DELETED),
         ],
+    )
+    if not with_tags:
+        con.commit()
+        con.close()
+        return
+    con.executemany(
+        "INSERT INTO ZREMCDHASHTAGLABEL VALUES (?,?,?)",
+        [(1, "Buy", "buy"), (2, "autoreview", "autoreview"), (3, "Unused", "unused")],
     )
     rows = [
         # (pk, ent, deleted, label, reminder)
@@ -680,6 +689,46 @@ def t_tagstore_list_and_filter():
             ts.reminders_with_tags(["buy", "autoreview"], match_all=True),
             {FIX_B},
         )
+
+
+@test("A", "tag store sees the first tag added to an untagged store")
+def t_tagstore_first_tag():
+    """Guard against caching an unresolved schema.
+
+    The reminder FK column is learned from live hashtag rows, so a store
+    with none (a fresh account, or Data-local.sqlite) resolves without
+    one. If that were cached, the first tag written later in the same
+    process would stay invisible until the connector restarted.
+    """
+    import sqlite3
+    import tempfile
+
+    from apple_reminders_mcp.tagstore import RemindersTagStore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        path = d / "Data-local.sqlite"
+        _build_fixture_store(path, 33, "ZREMINDER1", with_tags=False)
+        ts = RemindersTagStore(stores_dir=d)
+
+        eq(ts.list_tags(), [])
+        eq(ts.tags_for_reminder(FIX_A), [])
+        eq(ts.reminders_with_tags(["Buy"]), set())
+
+        # What Reminders writes when the user tags reminder A, while the
+        # connector (and its open read-only connection) stays up.
+        con = sqlite3.connect(path)
+        con.execute("INSERT INTO ZREMCDHASHTAGLABEL VALUES (1, 'Buy', 'buy')")
+        con.execute(
+            "INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZMARKEDFORDELETION, "
+            "ZHASHTAGLABEL, ZREMINDER1) VALUES (100, 33, 0, 1, 10)"
+        )
+        con.commit()
+        con.close()
+
+        eq([(t.name, t.reminder_ids) for t in ts.list_tags()], [("Buy", [FIX_A])])
+        eq(ts.tags_for_reminder(FIX_A), ["Buy"])
+        eq(ts.reminders_with_tags(["buy"]), {FIX_A})
 
 
 @test("A", "tag store reports an unreadable store instead of empty tags")

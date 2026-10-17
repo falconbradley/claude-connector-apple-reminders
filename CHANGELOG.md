@@ -12,6 +12,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **`assign_reminder` and `unassign_reminder`**, through private ReminderKit like the tag and link writers. Assigning notifies the assignee, as in the app; assigning the person already assigned saves nothing. Verified live on a real shared list.
 - Changing who a list is shared with is deliberately not offered: it sends iCloud invitations.
 
+### Fixed
+
+- **The first tag on an untagged account now shows up without a restart.** The tag reader cached a store's layout even when it had not yet found the column linking tags to reminders, which it can only learn once a tag exists. On a fresh account, or in the on-device store, a newly added tag stayed invisible to `list_tags` and the `tags` filter until the connector restarted.
+
 ## [0.3.3] — 2026-10-06
 
 ### Changed

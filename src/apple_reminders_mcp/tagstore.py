@@ -135,10 +135,10 @@ class RemindersTagStore:
     def __init__(self, stores_dir: Optional[Path] = None) -> None:
         self._dir = stores_dir or _STORES_DIR
         self._local = threading.local()
-        # path → resolved schema, or None when this store has no readable
-        # hashtag model. Schema shape is stable for a given file, so unlike
-        # tag *data* it is safe to remember.
-        self._schemas: dict[str, Optional[dict[str, Any]]] = {}
+        # path → resolved schema. Schema shape is stable for a given file,
+        # so unlike tag *data* it is safe to remember — but only once the
+        # reminder FK probe has succeeded (see _schema).
+        self._schemas: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -238,8 +238,13 @@ class RemindersTagStore:
             if key in self._schemas:
                 return self._schemas[key]
         resolved = self._resolve_schema(path, con)
-        with self._lock:
-            self._schemas[key] = resolved
+        # The FK column is learned from live hashtag rows, so a store with
+        # no tags yet resolves without one. Caching that would hide the
+        # first tag written later in this process until a restart; leave
+        # it uncached so the next read probes again.
+        if resolved is not None and resolved["reminder_fk"]:
+            with self._lock:
+                self._schemas[key] = resolved
         return resolved
 
     def _resolve_schema(
