@@ -48,7 +48,7 @@ Tags
 Real tags — the chips you see on a reminder in Reminders.app — are NOT
 exposed by EventKit or by Reminders' AppleScript dictionary. They are read
 directly from the Reminders app's own Core Data store, which needs Full
-Disk Access for the host process (Claude Desktop). Without it, `tags` comes
+Disk Access for the extension's `uv` (not Claude). Without it, `tags` comes
 back as null with `tags_unavailable_reason` set, rather than as an empty
 list that would falsely read as "no tags".
 
@@ -472,7 +472,7 @@ def list_tags() -> list[TagInfo]:
     deletes a label as soon as nothing references it.
 
     Reads the Reminders app's own store, which needs Full Disk Access for
-    the host process; without it this raises rather than returning [].
+    the extension's `uv`; without it this raises rather than returning [].
     """
     store = _require_store()
     reason = store.tags_unavailable_reason()

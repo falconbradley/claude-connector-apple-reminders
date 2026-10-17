@@ -731,6 +731,36 @@ def t_tagstore_first_tag():
         eq(ts.reminders_with_tags(["buy"]), {FIX_A})
 
 
+@test("A", "store errors say which uv needs Full Disk Access")
+def t_store_errors_name_uv():
+    """Every store reader's Full Disk Access error carries the grant steps.
+
+    Claude Desktop makes its bundled uv, not Claude, responsible for an
+    extension's privacy grants, so "give the host process access" sends
+    people to the wrong app. Covers both ways a read fails: no store
+    directory at all, and a store file that will not open.
+    """
+    import tempfile
+
+    from apple_reminders_mcp.launcher import full_disk_access_steps
+    from apple_reminders_mcp.linkstore import RemindersLinkStore
+    from apple_reminders_mcp.sharestore import RemindersShareStore
+    from apple_reminders_mcp.tagstore import RemindersTagStore
+
+    steps = full_disk_access_steps()
+    with tempfile.TemporaryDirectory() as tmp:
+        broken = Path(tmp) / "broken"
+        broken.mkdir()
+        (broken / "Data-ACCOUNT1.sqlite").write_bytes(b"not a database" * 100)
+        for cls in (RemindersTagStore, RemindersLinkStore, RemindersShareStore):
+            for where in (Path(tmp) / "nope", broken):
+                reason = cls(stores_dir=where).unavailable_reason()
+                not_none(reason, f"{cls.__name__} read {where.name} without error")
+                is_in(steps, reason, f"{cls.__name__} ({where.name}) omits the uv steps")
+                truthy("host process" not in reason,
+                       f"{cls.__name__} ({where.name}) still says 'host process'")
+
+
 @test("A", "tag store reports an unreadable store instead of empty tags")
 def t_tagstore_missing():
     import tempfile

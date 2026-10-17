@@ -49,6 +49,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
+from .launcher import full_disk_access_steps
 from .models import LinkedContent
 from .tagstore import _STORES_DIR
 
@@ -71,7 +72,7 @@ _URL_IN_BYTES = re.compile(rb"[a-zA-Z][a-zA-Z0-9+.-]*://[^\x00-\x20\"'<>]+")
 class LinkStoreError(RuntimeError):
     """Raised when the local Reminders store cannot be read.
 
-    Almost always missing Full Disk Access for the host process.
+    Almost always missing Full Disk Access for the extension's ``uv``.
     """
 
 
@@ -222,9 +223,9 @@ class RemindersLinkStore:
         except LinkStoreError as exc:
             return str(exc)
         return (
-            f"No readable Reminders store found under {self._dir}. Is "
-            "Reminders set up on this Mac, and does the host process have "
-            "Full Disk Access?"
+            f"No readable Reminders store found under {self._dir}. Either "
+            "Reminders is not set up on this Mac, or the extension lacks "
+            "Full Disk Access.\n\n" + full_disk_access_steps()
         )
 
     def _connect(self, path: Path) -> sqlite3.Connection:
@@ -245,8 +246,8 @@ class RemindersLinkStore:
         except sqlite3.Error as exc:
             raise LinkStoreError(
                 f"Could not open {path.name} read-only: {exc}. This usually "
-                "means the host process is missing Full Disk Access — see "
-                "the README."
+                "means the extension is missing Full Disk Access.\n\n"
+                + full_disk_access_steps()
             ) from exc
         cache[str(path)] = con
         return con
@@ -269,9 +270,9 @@ class RemindersLinkStore:
         paths = self.store_paths()
         if not paths:
             raise LinkStoreError(
-                f"No Reminders store found under {self._dir}. Is Reminders "
-                "set up on this Mac, and does the host process have Full "
-                "Disk Access?"
+                f"No Reminders store found under {self._dir}. Either "
+                "Reminders is not set up on this Mac, or the extension lacks "
+                "Full Disk Access.\n\n" + full_disk_access_steps()
             )
         usable: list[tuple[Path, sqlite3.Connection]] = []
         errors: list[str] = []

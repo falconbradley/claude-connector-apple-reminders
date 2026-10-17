@@ -68,7 +68,7 @@ writer, and the sole sync and auth engine. Nothing here is cached across
 calls: a cached tag map is exactly how a stale read gets served, which is
 the bug this feature was reported alongside.
 
-Requires Full Disk Access for the host process, since Group Containers
+Requires Full Disk Access for the extension's ``uv``, since Group Containers
 are TCC-protected. Without it, callers get a clear error rather than a
 silently empty tag list.
 """
@@ -116,7 +116,7 @@ _UUID_FROM_HEX = (
 class TagStoreError(RuntimeError):
     """Raised when the local Reminders store cannot be read.
 
-    Almost always missing Full Disk Access for the host process.
+    Almost always missing Full Disk Access for the extension's ``uv``.
     """
 
 
@@ -183,9 +183,9 @@ class RemindersTagStore:
         paths = self.store_paths()
         if not paths:
             raise TagStoreError(
-                f"No Reminders store found under {self._dir}. Is Reminders "
-                "set up on this Mac, and does the host process have Full "
-                "Disk Access?"
+                f"No Reminders store found under {self._dir}. Either "
+                "Reminders is not set up on this Mac, or the extension lacks "
+                "Full Disk Access.\n\n" + full_disk_access_steps()
             )
         usable: list[tuple[sqlite3.Connection, dict[str, Any]]] = []
         errors: list[str] = []
