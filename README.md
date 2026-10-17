@@ -1,6 +1,6 @@
 # Apple Reminders MCP
 
-A Claude Desktop extension that gives **Claude full access to Apple Reminders** on macOS via Apple's first-class **EventKit** framework. Read, create, update, complete, and delete reminders — including subtasks, recurrence rules, alarms, location-based geofences, real tags, and the Mail / Messages chip that links a reminder to its source email or chat.
+A Claude Desktop extension that gives **Claude full access to Apple Reminders** on macOS via Apple's first-class **EventKit** framework. Read, create, update, complete, and delete reminders — including subtasks, recurrence rules, alarms, location-based geofences, real tags, the Mail / Messages chip that links a reminder to its source email or chat, and who a shared list's reminders are assigned to.
 
 Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/12922929-building-desktop-extensions-with-mcpb) with the Reminders.app icon and one-click install.
 
@@ -10,14 +10,14 @@ Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/1
 
 | Tool | Description |
 |------|-------------|
-| `list_reminder_lists` | Every reminder list with id, title, color, source/account, and write-access flag |
+| `list_reminder_lists` | Every reminder list with id, title, color, source/account, write-access flag, and who an iCloud list is shared with |
 | `create_reminder_list` | Create a new list (optional color and source) |
 | `update_reminder_list` | Rename or recolor an existing list |
 | `delete_reminder_list` | Delete a list and all its reminders (destructive) |
 | `get_stats` | Aggregate counts: list count, total, incomplete, completed, overdue, due today |
-| `list_reminders` | Reminders in one or more lists with filters: completed, priority, due date, has-subtasks, text, tags |
+| `list_reminders` | Reminders in one or more lists with filters: completed, priority, due date, has-subtasks, text, tags, assignee |
 | `search_reminders` | Free-text search across title and notes, with the same filters |
-| `get_reminder` | Full detail — notes, URL, recurrence, alarms, location, subtask ids, real tags, linked content, timestamps |
+| `get_reminder` | Full detail — notes, URL, recurrence, alarms, location, subtask ids, real tags, linked content, assignment, timestamps |
 | `get_reminder_link` | `x-apple-reminderkit://` URL to open the reminder in Reminders.app |
 | `list_subtasks` | Immediate children of a parent reminder |
 | `list_tags` | Every real Apple Reminders tag, with how many reminders carry it |
@@ -26,6 +26,8 @@ Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/1
 | `set_reminder_tags` | Replace a reminder's tags outright; empty list clears them |
 | `set_reminder_link` | Attach linked content — the Mail / Messages chip — from a `message://` URL, a Messages chat guid, or an `https://` URL |
 | `clear_reminder_link` | Remove a reminder's linked content |
+| `assign_reminder` | Assign a reminder on a shared iCloud list to one of the list's members (notifies them) |
+| `unassign_reminder` | Remove a reminder's assignment |
 | `create_reminder` | Create with full property set: notes, URL, due/start dates, priority, recurrence, alarms, location, parent (for subtasks), real tags, linked content |
 | `update_reminder` | Update any subset of properties; `clear_*` flags explicitly remove fields |
 | `complete_reminder` | Mark complete or uncomplete (or toggle if `completed` is null) |
@@ -219,6 +221,90 @@ email in Mail.app, and clicking the Messages chip opens the chat.
 
 ---
 
+## Sharing and assignments
+
+A list shared through iCloud has members, and a reminder on it can be
+assigned to one of them. EventKit sees neither: the shared list looks like
+any other calendar, and `EKReminder` has no assignee. Both live in the same
+Reminders store as tags, so they are read the same way.
+
+### Reading
+
+`list_reminder_lists` gives every list a `sharing` object:
+
+| Field | What it is |
+|---|---|
+| `is_shared` | The list has other members, or was shared with you |
+| `owned_by_me` | You own the list (true for any list nobody shared with you) |
+| `owner` | The owner's member record, when the list is shared |
+| `sharees` | Every member, owner first, **you included**. Each has `id`, `name`, `email` or `phone`, `status` (`accepted` / `pending` / `removed`), `is_owner` and `is_me` |
+
+`get_reminder` adds `assignment`, which has the `assignee`, who it was
+`assigned_by`, and `assigned_date`. `list_reminders` and
+`search_reminders` take `assigned_to` (`"me"`, a member id, an email, a
+phone number or a name) and `assigned` (`true` / `false`). Same convention
+as `tags`: `null` with a `*_unavailable_reason` means the store could not
+be read, `null` without one means "not shared" or "not assigned".
+
+A member's `id` is the CloudKit share-participant id. It is **per list**:
+the same person is a different member on each list they share. That is why
+`assigned_to` matches names, emails and phone numbers across every list.
+
+What is on disk, decoded from real rows (3 shared lists, 8 members, 17
+assignments; the details are in `sharestore.py`):
+
+- `ZREMCDBASELIST.ZSHARINGSTATUS` — 0 not shared, 1 shared by you, 2
+  shared with you. The owner is `ZSHAREDOWNERIDENTIFIER`.
+- `REMCDSharee` rows in the shared `ZREMCDOBJECT` table — one per member
+  per list, with names and a `mailto:` / `tel:` address.
+- `REMCDAssignment` rows — the assignee and sender as participant ids.
+- **Which member is you** comes from the list's archived `CKShare`
+  (`ZCKSERVERSHAREDATA`), decoded with `plistlib` like the link chips.
+  Each participant there carries `IsCurrentUser`.
+
+The `owned_by_me` / `is_shared` rules mirror `REMList`'s own class methods,
+and a static test checks them against ReminderKit on every run.
+
+### Assigning
+
+`assign_reminder` and `unassign_reminder`. Pass `assignee` as `"me"`, a
+member id, an email, a phone number or a name. It is matched against the
+reminder's own list only. A name that fits two members is refused, and the
+error lists everyone with their ids. You can assign to someone whose
+invitation is still pending, since Reminders allows it too, but not to
+someone who has left.
+
+**Assigning notifies the assignee**, on their own devices, the same as
+assigning in the app. Assigning the person already assigned saves nothing
+and sends nothing.
+
+This uses private ReminderKit, for the same reason as
+[writing tags](#writing-tags):
+
+```
+REMStore.fetchReminderWithDACalendarItemUniqueIdentifier:inList:error:
+reminder.list.shareeContext.sharees              -> [REMSharee]
+REMSaveRequest(store).updateReminder:            -> REMReminderChangeItem
+  .assignmentContext.removeAllAssignments
+  .assignmentContext.addAssignmentWithAssignee:originator:status:(member, you, 1)
+REMSaveRequest.saveSynchronouslyWithError:
+```
+
+The writer checks the assignee against ReminderKit's own member list
+before saving, refuses if it cannot tell which member is you, and reads
+the result back from ReminderKit. Verified live on 2026-10-17 through the
+installed connector, on a real shared list. Assigning a reminder to "me"
+wrote one assignment row of the same shape as Reminders.app's own.
+Assigning the same person again, by name, saved nothing. Unassigning
+soft-deleted the row, and assigning on an unshared list was refused.
+Assigning to *another* member has not been run live, since that notifies
+them. Group B has an opt-in round trip (see [Tests](#tests)).
+
+Changing **who a list is shared with** is deliberately not offered. That
+sends iCloud invitations to other people.
+
+---
+
 ## Requirements
 
 - macOS 14 Sonoma or later (`requestFullAccessToReminders` was added in 14)
@@ -226,8 +312,9 @@ email in Mail.app, and clicking the Messages chip opens the chat.
 - Claude Desktop with extension support
 - Reminders permission granted to the extension's `uv` (see [Permissions](#permissions))
 - Full Disk Access for the same `uv` — **only** needed to read real
-  tags and linked content; every other tool works without it (see
-  [Tags](#tags) and [Linked content](#linked-content))
+  tags, linked content, sharing and assignments; every other tool works
+  without it (see [Tags](#tags), [Linked content](#linked-content) and
+  [Sharing and assignments](#sharing-and-assignments))
 
 ---
 
@@ -274,7 +361,7 @@ If the prompt doesn't appear (which can happen with unsigned interpreters launch
 2. Enable **uv** — not Claude. Claude Desktop launches extension servers through a helper that makes the spawned `uv` (`~/Library/Application Support/Claude/uv-runtime/<version>/uv`) responsible for their permissions. The connector's permission error prints the exact path.
 3. Quit Claude (⌘Q) and reopen it
 
-**Full Disk Access** (only for tags and linked content): System Settings → Privacy & Security → Full Disk Access → **+**, press ⌘⇧G, and paste the same `uv` path — `get_reminder`'s `tags_unavailable_reason` prints it. Then quit Claude (⌘Q) and reopen it; macOS reads this permission only at launch.
+**Full Disk Access** (only for tags, linked content, sharing and assignments): System Settings → Privacy & Security → Full Disk Access → **+**, press ⌘⇧G, and paste the same `uv` path — `get_reminder`'s `tags_unavailable_reason` prints it. Then quit Claude (⌘Q) and reopen it; macOS reads this permission only at launch.
 
 To verify access status, run:
 
@@ -310,6 +397,7 @@ Once installed, just ask Claude naturally:
 - *"Mark my 'Pay rent' reminder complete."*
 - *"What's tagged #urgent that's still incomplete?"*
 - *"Make a reminder to reply to that email, linked to it so I can open it from Reminders."*
+- *"What's assigned to me on the shared list?"* / *"Assign 'Book flights' to Pat."*
 - *"Add a reminder to call mom when I leave the office (geofence at 37.7749, -122.4194)."*
 
 ---
@@ -354,6 +442,8 @@ apple-reminders-mcp/
         ├── tagwriter.py             # Tag writes via private ReminderKit
         ├── linkstore.py             # Read-only reader + decoder for linked content
         ├── linkwriter.py            # Linked-content writes via private ReminderKit
+        ├── sharestore.py            # Read-only reader for list sharing and assignments
+        ├── assignwriter.py          # Assignment writes via private ReminderKit
         ├── permissions.py           # TCC grant helpers
         └── models.py                # Pydantic data models
 ```
@@ -367,8 +457,13 @@ apple-reminders-mcp/
 uv run python tests/test_e2e.py --skip-live
 
 # Full suite (requires Reminders permission, and Full Disk Access for the
-# tag and linked-content tests)
+# tag, linked-content and sharing tests)
 uv run python tests/test_e2e.py
+
+# Also run the assignment round trip. It creates a reminder on a real
+# shared list (the other members will see it briefly), assigns it to you,
+# and deletes it.
+APPLE_REMINDERS_TEST_SHARED_LIST=<list id> uv run python tests/test_e2e.py
 ```
 
 Three groups:
@@ -377,10 +472,13 @@ Three groups:
   generated fixture that reproduces the awkward parts of the real schema:
   a per-store entity id, the shared wide object table, soft-deleted rows.
   Also builds the linked-content activities the writer would save and
-  checks the store reader decodes them to the same thing.
+  checks the store reader decodes them to the same thing, and runs the
+  sharing reader against a fixture with numbered columns, an archived
+  `CKShare`, soft-deleted members and stacked assignments.
 - **C — live local store.** Reads the real Reminders store; needs Full Disk
   Access but *not* Reminders permission. Skipped with a reason otherwise.
-  Includes decoding every Mail / Messages chip already in the store.
+  Includes decoding every Mail / Messages chip already in the store, and
+  resolving every assignment to a named member of a shared list.
 - **B — live EventKit.** Operates against a dedicated `__claude_mcp_test__`
   list, created at setup and torn down at the end. Needs Reminders
   permission, which a plain shell does not have — run these through the
@@ -418,10 +516,12 @@ For comparison, the same operations via AppleScript would take 5–30 seconds.
 - [x] Real Apple Reminders tags — read, enumerate, filter by, and write them
 - [x] `x-apple-reminderkit://` deep links
 - [x] Linked content — the Mail / Messages chip — read and write
+- [x] Shared lists — who a list is shared with — read
+- [x] Assignments on shared lists — read, filter by, assign and unassign
 
 **v2 — under consideration**
 - [ ] Smart lists (today, scheduled, all, completed, flagged)
-- [ ] Shared list write-back (currently best-effort; depends on CalDAV permissions)
+- [ ] Inviting people to, or removing them from, a shared list (sends iCloud invitations, so deliberately left out)
 - [ ] Bulk operations (delete multiple, complete multiple, move multiple)
 - [ ] Public tags / linked-content API if Apple ships one — would let both write paths drop private ReminderKit
 
@@ -435,6 +535,8 @@ For comparison, the same operations via AppleScript would take 5–30 seconds.
 - macOS-only (`"platforms": ["darwin"]` in manifest).
 - The connector never reaches outside the Reminders entity — no Calendar events, contacts, or files.
 - Destructive operations (`delete_reminder_list`, `delete_reminder`) are explicit tools the model must choose to call; they don't run as side effects of reads.
+- `assign_reminder` is the one tool that reaches another person: Reminders notifies the assignee. It is never a side effect of another call.
+- Shared lists' member names, emails and phone numbers are reported to Claude, since they are what you would see in Reminders.app.
 
 ---
 

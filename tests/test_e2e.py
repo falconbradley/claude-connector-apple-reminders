@@ -12,8 +12,8 @@ Tests are split into two groups:
 
   Group C — Live local Reminders store (requires Full Disk Access)
     Reads the real Reminders Core Data store to check real-tag reading,
-    the real-tag / text-hashtag split, and that every linked-content
-    chip in the store decodes. Needs no Reminders TCC grant, only file
+    the real-tag / text-hashtag split, that every linked-content chip in
+    the store decodes, and that every assignment resolves to a member. Needs no Reminders TCC grant, only file
     access. Skipped with a clear message when unreadable.
 
   Group B — Live EventKit tests (requires Reminders access)
@@ -312,7 +312,8 @@ def t_manifest_matches_tools():
         )
     for name in ("add_reminder_tags", "remove_reminder_tags",
                  "set_reminder_tags", "list_tags",
-                 "set_reminder_link", "clear_reminder_link"):
+                 "set_reminder_link", "clear_reminder_link",
+                 "assign_reminder", "unassign_reminder"):
         is_in(name, listed, f"{name} is not advertised in manifest.json")
 
 
@@ -582,7 +583,7 @@ def t_reads_refresh():
     for name in (
         "get_reminder", "list_subtasks", "get_stats", "list_reminders",
         "create_reminder", "update_reminder", "complete_reminder",
-        "delete_reminder",
+        "delete_reminder", "assign",
     ):
         body = bodies.get(name)
         not_none(body, f"could not find {name} in reminders.py")
@@ -1161,6 +1162,521 @@ def t_tag_writer_loads():
     truthy(w.available())
 
 
+# ---------------------------------------------------------------------------
+# Sharing and assignments — synthetic fixture
+# ---------------------------------------------------------------------------
+
+SH_ME1 = "11111111-0000-0000-0000-00000000000A"
+SH_PAT1 = "22222222-0000-0000-0000-00000000000B"
+SH_JO = "33333333-0000-0000-0000-00000000000C"
+SH_ZED = "44444444-0000-0000-0000-00000000000D"
+SH_PAT2 = "55555555-0000-0000-0000-00000000000E"
+SH_ME2 = "66666666-0000-0000-0000-00000000000F"
+LIST_MINE = "AAAA0000-1111-2222-3333-444444444444"
+LIST_THEIRS = "BBBB0000-1111-2222-3333-444444444444"
+LIST_PLAIN = "CCCC0000-1111-2222-3333-444444444444"
+LIST_GONE = "DDDD0000-1111-2222-3333-444444444444"
+REM_1 = "EEEE0000-0000-0000-0000-000000000001"
+REM_2 = "EEEE0000-0000-0000-0000-000000000002"
+REM_3 = "EEEE0000-0000-0000-0000-000000000003"
+REM_GONE = "EEEE0000-0000-0000-0000-000000000004"
+REM_PLAIN = "EEEE0000-0000-0000-0000-000000000005"
+
+
+def _uuid_bytes(u: str) -> bytes:
+    return bytes.fromhex(u.replace("-", ""))
+
+
+def _share_archive(participants: list[dict]) -> bytes:
+    """A CKShare archived with its system fields, the shape Apple stores.
+
+    Each participant dict takes id, type (1 = owner), acceptance,
+    current (IsCurrentUser) and record (UserRecordID.RecordName, or None
+    for an invitee with no identity yet). References are binary-plist
+    UIDs, exactly as in ZCKSERVERSHAREDATA.
+    """
+    import plistlib
+
+    UID = plistlib.UID
+    objects: list = ["$null", {"$classname": "NSMutableArray"},
+                     {"$classname": "CKShareParticipant"}]
+    refs = []
+    for p in participants:
+        objects.append(p["id"])
+        pid = UID(len(objects) - 1)
+        identity = UID(0)
+        if p.get("record"):
+            objects.append(p["record"])
+            name = UID(len(objects) - 1)
+            objects.append({"RecordName": name})
+            record = UID(len(objects) - 1)
+            objects.append({"UserRecordID": record})
+            identity = UID(len(objects) - 1)
+        objects.append({
+            "$class": UID(2), "ParticipantID": pid, "UserIdentity": identity,
+            "Type": p["type"], "AcceptanceStatus": p["acceptance"],
+            "IsCurrentUser": p.get("current", False),
+        })
+        refs.append(UID(len(objects) - 1))
+    objects.append({"$class": UID(1), "NS.objects": refs})
+    archive = {
+        "$archiver": "NSKeyedArchiver", "$version": 100000,
+        "$top": {"Participants": UID(len(objects) - 1), "Permission": 1},
+        "$objects": objects,
+    }
+    return plistlib.dumps(archive, fmt=plistlib.FMT_BINARY)
+
+
+def _build_share_fixture(
+    path: Path, sharee_ent: int, assignment_ent: int, reminder_fk: str,
+    status_col: str, address_col: str, with_share: bool = True,
+) -> None:
+    """Write a miniature store with the real sharing schema's awkward parts.
+
+    Sharees and assignments share ZREMCDOBJECT with other entities, their
+    entity ids are parameterised, and the status, address and reminder
+    columns are the numbered duplicates Core Data really generates.
+    """
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    numbered = lambda base: ", ".join(  # noqa: E731
+        f"{base}{s} INTEGER" for s in ("", "1", "2", "3", "4", "5")
+    )
+    con.executescript(
+        f"""
+        CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER, Z_NAME VARCHAR, Z_SUPER INTEGER, Z_MAX INTEGER);
+        CREATE TABLE ZREMCDBASELIST (
+            Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZMARKEDFORDELETION INTEGER,
+            ZNAME VARCHAR, ZCKIDENTIFIER VARCHAR, ZIDENTIFIER BLOB,
+            ZSHARINGSTATUS INTEGER, ZSHAREDOWNERIDENTIFIER BLOB,
+            ZCKSERVERSHAREDATA BLOB
+        );
+        CREATE TABLE ZREMCDOBJECT (
+            Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZMARKEDFORDELETION INTEGER,
+            ZLIST INTEGER, ZCKIDENTIFIER VARCHAR, ZIDENTIFIER BLOB,
+            ZFIRSTNAME VARCHAR, ZLASTNAME VARCHAR, ZNICKNAME VARCHAR,
+            ZDISPLAYNAME VARCHAR, ZADDRESS VARCHAR, ZADDRESS1 VARCHAR,
+            ZSTATUS INTEGER, ZSTATUS1 INTEGER, {numbered("ZREMINDER")},
+            ZCKASSIGNEEIDENTIFIER VARCHAR, ZCKORIGINATORIDENTIFIER VARCHAR,
+            ZASSIGNEDDATE TIMESTAMP, ZASSIGNEE INTEGER
+        );
+        CREATE TABLE ZREMCDREMINDER (
+            Z_PK INTEGER PRIMARY KEY, ZTITLE VARCHAR, ZMARKEDFORDELETION INTEGER,
+            ZDACALENDARITEMUNIQUEIDENTIFIER VARCHAR, ZLIST INTEGER
+        );
+        """
+    )
+    con.executemany(
+        "INSERT INTO Z_PRIMARYKEY VALUES (?,?,0,0)",
+        [(3, "REMCDList"), (4, "REMCDSmartList"), (sharee_ent, "REMCDSharee"),
+         (assignment_ent, "REMCDAssignment"), (assignment_ent + 7, "REMCDAlarm")],
+    )
+    share = _share_archive([
+        # You, recognised by CloudKit's record name rather than the flag.
+        {"id": SH_ME1, "type": 1, "acceptance": 2, "record": "__defaultOwner__"},
+        {"id": SH_PAT1, "type": 2, "acceptance": 2, "record": "_abc123"},
+        # An unanswered invitation has no identity yet.
+        {"id": SH_JO, "type": 2, "acceptance": 1, "record": None},
+    ]) if with_share else None
+    con.executemany(
+        "INSERT INTO ZREMCDBASELIST VALUES (?,?,?,?,?,?,?,?,?)",
+        [
+            (1, 3, 0, "Mine", LIST_MINE, _uuid_bytes(LIST_MINE), 1,
+             _uuid_bytes(SH_ME1), share),
+            # Shared with you, and no archived share to say which one is you.
+            (2, 3, 0, "Theirs", LIST_THEIRS, _uuid_bytes(LIST_THEIRS), 2,
+             _uuid_bytes(SH_PAT2), None),
+            (3, 3, 0, "Plain", LIST_PLAIN, _uuid_bytes(LIST_PLAIN), 0, None, None),
+            (4, 3, 1, "Gone", LIST_GONE, _uuid_bytes(LIST_GONE), 1, None, None),
+            # A smart list is a different entity in the same table.
+            (5, 4, 0, "Today", "FFFF0000-1111-2222-3333-444444444444", None, 0, None, None),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO ZREMCDREMINDER VALUES (?,?,?,?,?)",
+        [(10, "r1", 0, REM_1, 1), (11, "r2", 0, REM_2, 1), (12, "r3", 0, REM_3, 2),
+         (13, "gone", 1, REM_GONE, 1), (14, "plain", 0, REM_PLAIN, 3)],
+    )
+    sharees = [
+        # (pk, deleted, list, id, first, last, nick, address, status)
+        (100, 0, 1, SH_ME1, "Brad", "Tallon", None, "mailto:brad@example.com", 1),
+        (101, 0, 1, SH_PAT1, "Pat", "Smith", "Patty", "tel:+15551234567", 1),
+        (102, 0, 1, SH_JO, "Jo", None, None, "tel:+15559876543", 5),
+        (103, 1, 1, SH_ZED, "Zed", None, None, "mailto:zed@example.com", 1),
+        (104, 0, 2, SH_PAT2, "Pat", "Smith", None, "mailto:pat@example.com", 1),
+        (105, 0, 2, SH_ME2, "Brad", "Tallon", None, "tel:+15550001111", 1),
+    ]
+    for pk, deleted, lst, sid, first, last, nick, address, status in sharees:
+        con.execute(
+            f"INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZMARKEDFORDELETION, ZLIST, "
+            f"ZCKIDENTIFIER, ZIDENTIFIER, ZFIRSTNAME, ZLASTNAME, ZNICKNAME, "
+            f"{address_col}, {status_col}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (pk, sharee_ent, deleted, lst, sid, _uuid_bytes(sid), first, last,
+             nick, address, status),
+        )
+    assignments = [
+        # (pk, ent, deleted, reminder, assignee, originator, date)
+        (200, assignment_ent, 0, 10, SH_ME1, SH_PAT1, 700000000.0),
+        (201, assignment_ent, 0, 11, SH_PAT1, SH_ME1, 600000000.0),   # older
+        (202, assignment_ent, 0, 11, SH_JO, SH_ME1, 700000100.0),     # newest wins
+        (203, assignment_ent, 0, 12, SH_PAT2, None, 700000200.0),     # nullified sender
+        (204, assignment_ent, 0, 13, SH_ME1, SH_PAT1, 700000300.0),   # deleted reminder
+        (205, assignment_ent, 1, 14, SH_ME1, SH_PAT1, 700000400.0),   # deleted row
+        (206, assignment_ent + 7, 0, 14, SH_ME1, SH_PAT1, 1.0),       # other entity
+    ]
+    for pk, ent, deleted, rem, assignee, originator, when in assignments:
+        con.execute(
+            f"INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZMARKEDFORDELETION, "
+            f"{reminder_fk}, ZCKASSIGNEEIDENTIFIER, ZCKORIGINATORIDENTIFIER, "
+            f"ZASSIGNEDDATE, ZSTATUS) VALUES (?,?,?,?,?,?,?,1)",
+            (pk, ent, deleted, rem, assignee, originator, when),
+        )
+    con.commit()
+    con.close()
+
+
+def _share_fixture_store(d: Path, **kw):
+    from apple_reminders_mcp.sharestore import RemindersShareStore
+
+    args = dict(sharee_ent=36, assignment_ent=21, reminder_fk="ZREMINDER1",
+                status_col="ZSTATUS1", address_col="ZADDRESS1")
+    args.update(kw)
+    _build_share_fixture(d / "Data-ACCOUNT1.sqlite", **args)
+    return RemindersShareStore(stores_dir=d)
+
+
+@test("A", "sharing and assignment model shapes")
+def t_share_model_shape():
+    from apple_reminders_mcp.models import (
+        ListSharing, ReminderDetail, ReminderList, Sharee,
+    )
+
+    rl = ReminderList(id="abc", title="Errands", source_name="iCloud", source_type="calDAV")
+    # Same convention as tags: None + no reason == "not in the store".
+    eq(rl.sharing, None)
+    eq(rl.sharing_unavailable_reason, None)
+    rd = ReminderDetail(id="x", list_id="l", list_title="Errands", title="t")
+    eq(rd.assignment, None)
+    eq(rd.assignment_unavailable_reason, None)
+    eq(ListSharing().is_shared, False)
+    eq(Sharee(id="X").status, "unknown")
+
+
+@test("A", "share store reads lists, sharees and assignments from a fixture")
+def t_sharestore_fixture():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ss = _share_fixture_store(Path(tmp))
+        eq(ss.unavailable_reason(), None)
+        lists = ss.sharing_by_list()
+        eq(set(lists), {LIST_MINE, LIST_THEIRS, LIST_PLAIN},
+           "deleted lists and smart lists must not appear")
+
+        mine = lists[LIST_MINE]
+        truthy(mine.is_shared and mine.owned_by_me)
+        eq(mine.owner.id, SH_ME1, "owner comes from ZSHAREDOWNERIDENTIFIER")
+        eq([s.id for s in mine.sharees][0], SH_ME1, "owner is listed first")
+        eq({s.id for s in mine.sharees}, {SH_ME1, SH_PAT1, SH_JO},
+           "a soft-deleted sharee leaked in")
+        by_id = {s.id: s for s in mine.sharees}
+        truthy(by_id[SH_ME1].is_me, "__defaultOwner__ marks the current user")
+        truthy(not by_id[SH_PAT1].is_me)
+        eq(by_id[SH_ME1].name, "Brad Tallon")
+        eq(by_id[SH_ME1].email, "brad@example.com")
+        eq(by_id[SH_PAT1].phone, "+15551234567")
+        eq(by_id[SH_JO].status, "pending")
+        eq(by_id[SH_PAT1].status, "accepted")
+
+        theirs = lists[LIST_THEIRS]
+        truthy(theirs.is_shared and not theirs.owned_by_me)
+        eq(theirs.owner.id, SH_PAT2)
+        # No archived share, two members: the one who is not the owner is you.
+        eq([s.id for s in theirs.sharees if s.is_me], [SH_ME2])
+        # And the status falls back to the sharee row's own column.
+        eq({s.status for s in theirs.sharees}, {"accepted"})
+
+        plain = lists[LIST_PLAIN]
+        truthy(not plain.is_shared and plain.owned_by_me)
+        eq(plain.sharees, [])
+        eq(ss.sharing_for_list(LIST_PLAIN.lower()), plain, "ids are case-insensitive")
+        eq(ss.sharing_for_list("not-a-list"), None)
+
+        a = ss.assignments()
+        eq(set(a), {REM_1, REM_2, REM_3},
+           "deleted reminders, deleted rows and other entities must not appear")
+        eq(a[REM_1].assignee.id, SH_ME1)
+        truthy(a[REM_1].assignee.is_me)
+        eq(a[REM_1].assigned_by.name, "Pat Smith")
+        eq(a[REM_2].assignee.id, SH_JO, "the newest assignment is the current one")
+        eq(a[REM_3].assigned_by, None, "a nullified sender reads as None")
+        eq(a[REM_1].assigned_date.year, 2023)
+        eq(ss.assignment_for_reminder(REM_PLAIN), None)
+        eq(ss.assignment_for_reminder(REM_1.lower()).assignee.id, SH_ME1)
+
+
+@test("A", "share store finds the numbered columns wherever they land")
+def t_sharestore_drift():
+    """Entity ids and the numbered duplicate columns move between stores."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ss = _share_fixture_store(
+            Path(tmp), sharee_ent=37, assignment_ent=22, reminder_fk="ZREMINDER3",
+            status_col="ZSTATUS", address_col="ZADDRESS", with_share=False,
+        )
+        lists = ss.sharing_by_list()
+        by_id = {s.id: s for s in lists[LIST_MINE].sharees}
+        eq(by_id[SH_JO].status, "pending", "status read from the row, not the share")
+        eq(by_id[SH_PAT1].phone, "+15551234567")
+        # Without the share, owning the list still says which member is you.
+        truthy(by_id[SH_ME1].is_me)
+        eq(set(ss.assignments()), {REM_1, REM_2, REM_3})
+
+
+@test("A", "assignee matching and member resolution")
+def t_sharestore_matching():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ss = _share_fixture_store(Path(tmp))
+        eq(ss.reminders_assigned(), {REM_1, REM_2, REM_3})
+        eq(ss.reminders_assigned("me"), {REM_1})
+        eq(ss.reminders_assigned("ME "), {REM_1})
+        # One person is a different sharee on each list; a name spans both.
+        eq(ss.reminders_assigned("pat smith"), {REM_3})
+        eq(ss.reminders_assigned("Jo"), {REM_2})
+        eq(ss.reminders_assigned(SH_JO.lower()), {REM_2})
+        eq(ss.reminders_assigned("PAT@example.com"), {REM_3})
+        eq(ss.reminders_assigned("nobody"), set())
+
+        eq(ss.resolve_sharee(LIST_MINE, "me").id, SH_ME1)
+        eq(ss.resolve_sharee(LIST_THEIRS, "me").id, SH_ME2)
+        eq(ss.resolve_sharee(LIST_MINE, "Patty").id, SH_PAT1, "nickname")
+        eq(ss.resolve_sharee(LIST_MINE, "pat").id, SH_PAT1, "first name")
+        eq(ss.resolve_sharee(LIST_MINE, "555-123-4567").id, SH_PAT1,
+           "a phone number without its country code")
+        eq(ss.me_on_list(LIST_THEIRS).id, SH_ME2)
+        eq(ss.me_on_list(LIST_PLAIN), None)
+
+        for who, lst, needle in (
+            ("Zed", LIST_MINE, "Nobody on this list"),   # soft-deleted member
+            ("me", LIST_PLAIN, "not shared"),
+            ("me", "not-a-list", "not shared"),
+        ):
+            try:
+                ss.resolve_sharee(lst, who)
+            except ValueError as exc:
+                is_in(needle, str(exc))
+            else:
+                raise AssertionError(f"resolve_sharee({lst!r}, {who!r}) did not refuse")
+
+        # An ambiguous name is refused with the members listed, ids and all.
+        import sqlite3
+        con = sqlite3.connect(Path(tmp) / "Data-ACCOUNT1.sqlite")
+        con.execute("UPDATE ZREMCDOBJECT SET ZFIRSTNAME = 'Pat' WHERE Z_PK = 102")
+        con.commit()
+        con.close()
+        try:
+            ss.resolve_sharee(LIST_MINE, "pat")
+        except ValueError as exc:
+            is_in("more than one", str(exc))
+            is_in(SH_PAT1, str(exc))
+        else:
+            raise AssertionError("an ambiguous name was resolved")
+
+
+@test("A", "share decoder ignores malformed archives")
+def t_share_decoder_malformed():
+    from apple_reminders_mcp.sharestore import decode_share_participants
+
+    eq(decode_share_participants(None), {})
+    eq(decode_share_participants(b""), {})
+    eq(decode_share_participants(b"not a plist"), {})
+    decoded = decode_share_participants(_share_archive([
+        {"id": SH_PAT1.lower(), "type": 1, "acceptance": 2, "current": True},
+    ]))
+    truthy(decoded[SH_PAT1].is_me, "IsCurrentUser marks the current user")
+    truthy(decoded[SH_PAT1].is_owner)
+
+
+@test("A", "share store reports an unreadable store instead of no assignments")
+def t_sharestore_missing():
+    import tempfile
+
+    from apple_reminders_mcp.sharestore import RemindersShareStore, ShareStoreError
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ss = RemindersShareStore(stores_dir=Path(tmp) / "nope")
+        truthy(not ss.available())
+        is_in("Full Disk Access", ss.unavailable_reason())
+        for call in (lambda: ss.assignment_for_reminder(REM_1),
+                     lambda: ss.sharing_by_list(),
+                     lambda: ss.reminders_assigned("me")):
+            try:
+                call()
+            except ShareStoreError:
+                pass
+            else:
+                raise AssertionError(
+                    "the share store returned instead of raising on an "
+                    "unreadable store — callers would read that as 'nobody'"
+                )
+
+
+@test("A", "share store never opens the real store for writing")
+def t_sharestore_read_only():
+    src = (ROOT / "src" / "apple_reminders_mcp" / "sharestore.py").read_text()
+    is_in("mode=ro", src)
+    is_in("PRAGMA query_only", src)
+    for forbidden in ("INSERT ", "UPDATE ", "DELETE FROM", "DROP ", "mode=rw",
+                      "NSKeyedUnarchiver"):
+        truthy(forbidden not in src, f"sharestore.py contains {forbidden!r}")
+
+
+@test("A", "sharing rules match ReminderKit's own")
+def t_sharing_rules_match_reminderkit():
+    """is_owned_by_me / is_shared mirror REMList's class methods exactly.
+
+    Those methods are pure functions, so they run without Reminders
+    permission and catch any change Apple makes to the meaning of
+    ZSHARINGSTATUS.
+    """
+    from apple_reminders_mcp.sharestore import is_owned_by_me, is_shared
+
+    try:
+        import objc
+        from Foundation import NSBundle
+        if not NSBundle.bundleWithPath_(
+            "/System/Library/PrivateFrameworks/ReminderKit.framework"
+        ).load():
+            skip("ReminderKit not loadable on this macOS")
+        REMList = objc.lookUpClass("REMList")
+    except Exception as exc:
+        skip(f"ReminderKit unavailable: {exc}")
+    for status in range(0, 6):
+        eq(is_owned_by_me(status), bool(REMList.isOwnedByMeWithSharingStatus_(status)),
+           f"owned-by-me disagrees for sharing status {status}")
+        for count in (0, 1, 3):
+            eq(is_shared(count, status),
+               bool(REMList.isSharedWithShareeCount_sharingStatus_(count, status)),
+               f"is-shared disagrees for {count} sharees, status {status}")
+
+
+@test("A", "assignment filters fail loudly and refuse contradictions")
+def t_assignment_filter_guards():
+    import tempfile
+
+    from apple_reminders_mcp.sharestore import RemindersShareStore
+
+    store = _store_with([])
+    store._tags = None
+    with tempfile.TemporaryDirectory() as tmp:
+        store._sharing = RemindersShareStore(stores_dir=Path(tmp) / "nope")
+        try:
+            store.list_reminders(assigned_to="me", assigned=False)
+        except ValueError as exc:
+            is_in("contradict", str(exc))
+        else:
+            raise AssertionError("assigned_to with assigned=false was accepted")
+        for kwargs in ({"assigned": True}, {"assigned": False}, {"assigned_to": "me"}):
+            try:
+                store.list_reminders(**kwargs)
+            except RuntimeError as exc:
+                is_in("Cannot filter by assignment", str(exc))
+            else:
+                raise AssertionError(
+                    f"list_reminders({kwargs}) returned on an unreadable store"
+                )
+
+
+@test("A", "assign writer declares what it needs before using it")
+def t_assign_writer_capabilities():
+    import ast
+
+    from apple_reminders_mcp import assignwriter
+
+    src = (ROOT / "src" / "apple_reminders_mcp" / "assignwriter.py").read_text()
+    flat = {sel for sels in assignwriter._REQUIRED.values() for sel in sels}
+    for selector in (
+        "fetchReminderWithDACalendarItemUniqueIdentifier_inList_error_",
+        "fetchListWithObjectID_error_",
+        "updateReminder_",
+        "saveSynchronouslyWithError_",
+        "assignmentContext",
+        "currentAssignment",
+        "assigneeID",
+        "shareeContext",
+        "sharees",
+        "removeAllAssignments",
+        "addAssignmentWithAssignee_originator_status_",
+    ):
+        is_in(selector, flat, f"{selector} is called but not declared")
+        is_in(selector, src)
+
+    tree = ast.parse(src)
+    cls = next(
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RemindersAssignWriter"
+    )
+    apply_fn = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_apply"
+    )
+    body = ast.get_source_segment(src, apply_fn)
+    truthy(
+        body.index("_rem_store()") < body.index("removeAllAssignments"),
+        "_apply mutates before the capability check has run",
+    )
+    # An assignment with no sender must be refused before anything changes.
+    truthy(
+        body.index("assignment would have no sender")
+        < body.index("removeAllAssignments"),
+        "_apply clears the assignee before checking it can name the sender",
+    )
+
+
+@test("A", "assign writer never falls back to writing the store file")
+def t_assign_writer_no_sqlite():
+    src = (ROOT / "src" / "apple_reminders_mcp" / "assignwriter.py").read_text()
+    for forbidden in ("sqlite3", "INSERT ", "UPDATE ", "DELETE FROM"):
+        truthy(forbidden not in src, f"assignwriter.py references {forbidden!r}")
+
+
+@test("A", "assign write tools refuse cleanly when unavailable")
+def t_assign_write_guard():
+    from apple_reminders_mcp import server
+
+    class _Store:
+        def assign_writes_unavailable_reason(self):
+            return "ReminderKit did not load"
+
+    try:
+        server._require_assign_writes(_Store())
+    except RuntimeError as exc:
+        is_in("ReminderKit did not load", str(exc))
+    else:
+        raise AssertionError("_require_assign_writes did not raise")
+
+    class _OkStore:
+        def assign_writes_unavailable_reason(self):
+            return None
+
+    server._require_assign_writes(_OkStore())
+
+
+@test("A", "assign writer loads ReminderKit on this machine")
+def t_assign_writer_loads():
+    """Not a live write — just that the private API still matches."""
+    from apple_reminders_mcp.assignwriter import RemindersAssignWriter
+
+    w = RemindersAssignWriter()
+    reason = w.unavailable_reason()
+    if reason is not None and "does not appear to provide" in reason:
+        skip(f"ReminderKit unavailable on this macOS: {reason}")
+    eq(reason, None, "ReminderKit no longer matches what the writer calls")
+
+
 class _FakeSource:
     """Stand-in for EKSource: a title, a type, and its reminder calendars."""
 
@@ -1455,6 +1971,64 @@ def t_real_links_live():
         eq(ls.link_for_reminder(rid), link)
         eq(ls.link_for_reminder(rid.lower()), link, "id lookup must be case-insensitive")
     print(f"      (live store: {len(links)} linked reminders — {kinds})")
+
+
+@test("C", "sharing and assignments read from the live Reminders store")
+def t_real_sharing_live():
+    """Every live assignment must resolve to a named member of its list."""
+    from apple_reminders_mcp.sharestore import RemindersShareStore
+
+    ss = RemindersShareStore()
+    reason = ss.unavailable_reason()
+    if reason is not None:
+        skip(f"Local Reminders store unreadable: {reason}")
+
+    import sqlite3
+
+    # Distinct live reminders carrying a live assignment row, counted raw.
+    raw: set[str] = set()
+    for path in ss.store_paths():
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            ent = con.execute(
+                "SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = 'REMCDAssignment'"
+            ).fetchone()
+            if ent is None:
+                continue
+            cols = {r[1] for r in con.execute("PRAGMA table_info(ZREMCDOBJECT)")}
+            for fk in ("ZREMINDER", *(f"ZREMINDER{i}" for i in range(1, 6))):
+                if fk not in cols:
+                    continue
+                raw.update(row[0] for row in con.execute(
+                    f"SELECT upper(r.ZDACALENDARITEMUNIQUEIDENTIFIER) "
+                    f"FROM ZREMCDOBJECT o JOIN ZREMCDREMINDER r ON r.Z_PK = o.{fk} "
+                    f"WHERE o.Z_ENT = ? AND o.ZMARKEDFORDELETION = 0 "
+                    f"AND r.ZMARKEDFORDELETION = 0", (ent[0],)
+                ))
+            con.close()
+        except sqlite3.Error as exc:
+            skip(f"Could not count assignments: {exc}")
+
+    lists = ss.sharing_by_list()
+    shared = {lid: s for lid, s in lists.items() if s.is_shared}
+    for lid, s in shared.items():
+        eq(len([m for m in s.sharees if m.is_owner]), 1, f"list {lid} needs one owner")
+        eq(len([m for m in s.sharees if m.is_me]), 1, f"list {lid} needs one 'me'")
+        truthy(s.owned_by_me == s.owner.is_me, f"list {lid}: owner/me disagree")
+
+    assignments = ss.assignments()
+    eq(set(assignments), raw, "assignment rows and decoded assignments differ")
+    members = {m.id for s in shared.values() for m in s.sharees}
+    for rid, a in assignments.items():
+        is_in(a.assignee.id, members, f"{rid}'s assignee is on no shared list")
+        truthy(a.assignee.name, f"{rid}'s assignee has no name")
+    mine = ss.reminders_assigned("me")
+    truthy(mine <= set(assignments))
+    print(
+        f"      (live store: {len(shared)} shared lists, "
+        f"{sum(len(s.sharees) for s in shared.values())} members, "
+        f"{len(assignments)} assigned reminders, {len(mine)} assigned to you)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2088,6 +2662,59 @@ def t_create_with_link():
         raise AssertionError("create_reminder accepted a malformed link")
     eq(len(store.list_reminders(list_ids=[list_id], limit=500).reminders), n_before,
        "a reminder was created despite the malformed link")
+
+
+@test("B", "assigning on an unshared list is refused")
+def t_assign_unshared():
+    store = _store_or_skip()
+    list_id = _ensure_test_list()
+    if store.assign_writes_unavailable_reason() is not None:
+        skip("Assignment writes unavailable")
+    item = _track(store.create_reminder(title="zzassign unshared", list_id=list_id).id)
+    try:
+        store.assign(item, "me")
+    except ValueError as exc:
+        is_in("not shared", str(exc))
+    else:
+        raise AssertionError("a reminder on an unshared list was assigned")
+    # Unassigning an unassigned reminder is a no-op, not an error.
+    eq(store.unassign(item).assignment, None)
+
+
+# Opt-in: assignments only exist on a shared list, and a shared list has
+# other people on it. Set this to the id of a shared list whose members
+# know test reminders may appear briefly. Assigning to "me" notifies only you.
+SHARED_LIST_ENV = "APPLE_REMINDERS_TEST_SHARED_LIST"
+
+
+@test("B", "assignment write round-trip on a shared list (opt-in)")
+def t_assign_round_trip():
+    import os
+
+    shared_list = os.environ.get(SHARED_LIST_ENV)
+    if not shared_list:
+        skip(f"set {SHARED_LIST_ENV} to a shared list id to run this")
+    store = _store_or_skip()
+    if store.assign_writes_unavailable_reason() is not None:
+        skip("Assignment writes unavailable")
+
+    item = _track(store.create_reminder(
+        title="zzassign round-trip (test, safe to delete)", list_id=shared_list,
+    ).id)
+    done = store.assign(item, "me")
+    not_none(done.assignment)
+    truthy(done.assignment.assignee.is_me)
+    truthy(done.assignment.assigned_by.is_me)
+    # Assigning the same person again changes nothing.
+    eq(store.assign(item, "me").assignment.assignee.id, done.assignment.assignee.id)
+    total, rows = store.list_reminders(list_ids=[shared_list], assigned_to="me", limit=500)
+    is_in(item, [r.id for r in rows], "assigned_to=me misses a reminder just assigned")
+
+    cleared = store.unassign(item)
+    eq(cleared.assignment, None)
+    eq(cleared.assignment_unavailable_reason, None)
+    total, rows = store.list_reminders(list_ids=[shared_list], assigned=False, limit=500)
+    is_in(item, [r.id for r in rows], "assigned=false misses a reminder just unassigned")
 
 
 # ---------------------------------------------------------------------------

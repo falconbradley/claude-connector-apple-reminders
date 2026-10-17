@@ -39,6 +39,10 @@ Reminders — linked content (write)
   set_reminder_link        - Attach the Mail / Messages chip to a reminder
   clear_reminder_link      - Remove it
 
+Reminders — assignments (write)
+  assign_reminder          - Assign a reminder on a shared list to a member
+  unassign_reminder        - Remove the assignment
+
 Tags
 ----
 Real tags — the chips you see on a reminder in Reminders.app — are NOT
@@ -65,6 +69,15 @@ the store (`link`, null with `link_unavailable_reason` when unreadable)
 and written through ReminderKit (`set_reminder_link`, `clear_reminder_link`,
 and a `link` argument on `create_reminder`). Messages links are
 chat-level: Messages.app has no per-message deep link.
+
+Sharing and assignments
+-----------------------
+Who an iCloud list is shared with, and who a reminder on it is assigned
+to, are also invisible to EventKit. Both are read from the store
+(`sharing` on each list, `assignment` on each reminder, and the
+`assigned_to` / `assigned` filters) and assignments are written through
+ReminderKit. Changing who a list is shared with is not offered: that
+sends iCloud invitations to other people.
 
 Reminders — write
   create_reminder          - Create with full property set (recurrence, alarms, location, parent)
@@ -133,7 +146,8 @@ mcp = MCPServer(
         "complete, and delete reminders; and work with subtasks, "
         "recurrence, alarms, and locations. Reminders can carry real Apple "
         "tags and linked content (the Mail / Messages chip that opens the "
-        "source email or chat)."
+        "source email or chat). Lists shared through iCloud report their "
+        "members, and reminders on them can be assigned to a member."
     ),
     version=__version__,
 )
@@ -184,6 +198,13 @@ def _require_link_writes(store) -> None:
         raise RuntimeError(f"Cannot set linked content on reminders: {reason}")
 
 
+def _require_assign_writes(store) -> None:
+    """Fail early, and with a reason, when assignments cannot be written."""
+    reason = store.assign_writes_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(f"Cannot assign reminders: {reason}")
+
+
 # Free text a person might type. Clients read the tool schema, and the
 # schema alone cannot make a client send a digits-only label as a string:
 # a Messages SMS shortcode such as 42878 has arrived as a JSON integer and
@@ -213,6 +234,15 @@ def list_reminder_lists() -> list[ReminderList]:
 
     Returns id, title, color, source (account), and whether the list can be
     modified. Use the returned ids with other tools that take a `list_id`.
+
+    `sharing` says who an iCloud list is shared with: `is_shared`,
+    `owned_by_me`, the `owner`, and every member in `sharees` (you
+    included, with `is_me` set). Each member has a `name`, an `email` or
+    `phone`, and a `status` (accepted / pending / removed). A member's `id`
+    is what assign_reminder takes, and it differs from list to list. Null
+    with `sharing_unavailable_reason` set means the store could not be
+    read; null with no reason means the list is not an iCloud Reminders
+    list, so it cannot be shared this way.
     """
     return _require_store().list_lists()
 
@@ -286,6 +316,8 @@ def list_reminders(
     text: Optional[Text] = None,
     tags: Optional[list[str]] = None,
     match_all_tags: bool = False,
+    assigned_to: Optional[Text] = None,
+    assigned: Optional[bool] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> SearchResult:
@@ -303,6 +335,11 @@ def list_reminders(
                       Case-insensitive; a leading "#" is optional. This
                       matches genuine tags, not "#foo" text in the title.
         match_all_tags: If true, require every tag in `tags`; otherwise any.
+        assigned_to:  Only reminders assigned to this person: "me", a sharee
+                      id, an email, a phone number, or a name. Matches
+                      across every shared list. Implies assigned=true.
+        assigned:     True = only assigned reminders; false = only
+                      unassigned ones; null = either.
         limit:        Max results per page (default 50, max 500).
         offset:       Pagination offset.
     """
@@ -318,6 +355,8 @@ def list_reminders(
         text=text,
         tags=tags,
         match_all_tags=match_all_tags,
+        assigned_to=assigned_to,
+        assigned=assigned,
         limit=limit,
         offset=offset,
     )
@@ -334,6 +373,8 @@ def search_reminders(
     due_after: Optional[str] = None,
     tags: Optional[list[str]] = None,
     match_all_tags: bool = False,
+    assigned_to: Optional[Text] = None,
+    assigned: Optional[bool] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> SearchResult:
@@ -349,6 +390,11 @@ def search_reminders(
         tags:        Only reminders carrying these real Apple tags
                      (case-insensitive, leading "#" optional).
         match_all_tags: If true, require every tag in `tags`; otherwise any.
+        assigned_to: Only reminders assigned to this person: "me", a sharee
+                     id, an email, a phone number, or a name. Matches
+                     across every shared list. Implies assigned=true.
+        assigned:    True = only assigned reminders; false = only
+                     unassigned ones; null = either.
         limit:       Max results (default 50, max 500).
         offset:      Pagination offset.
     """
@@ -365,6 +411,8 @@ def search_reminders(
         due_after=_parse_iso(due_after, "due_after"),
         tags=tags,
         match_all_tags=match_all_tags,
+        assigned_to=assigned_to,
+        assigned=assigned,
         limit=limit,
         offset=offset,
     )
@@ -389,6 +437,11 @@ def get_reminder(reminder_id: str) -> ReminderDetail:
     the chat `title`. Null with `link_unavailable_reason` set means the
     store could not be read; null with no reason means there is no link.
     This is distinct from `url`, which Reminders.app never displays.
+
+    `assignment` is set when the reminder, on a shared list, is assigned
+    to someone: the `assignee`, who `assigned_by` them, and when. Null with
+    `assignment_unavailable_reason` set means the store could not be read;
+    null with no reason means nobody is assigned.
 
     Args:
         reminder_id: Identifier from list_reminders / search_reminders.
@@ -547,6 +600,51 @@ def clear_reminder_link(reminder_id: str) -> ReminderResult:
     store = _require_store()
     _require_link_writes(store)
     return ReminderResult(reminder=store.clear_link(reminder_id), success=True)
+
+
+@mcp.tool()
+def assign_reminder(reminder_id: str, assignee: Text) -> ReminderResult:
+    """Assign a reminder on a shared iCloud list to one of the list's members.
+
+    This tells the assignee: Reminders notifies them on their own devices,
+    just as assigning in the app does. Any current assignee is replaced.
+    Assigning to the person already assigned changes nothing and sends
+    nothing. Only reminders on a shared list can be assigned; see
+    `sharing` in list_reminder_lists for who is on each list.
+
+    Uses Apple's private ReminderKit framework (no supported API can
+    assign), so it can stop working after a macOS update — in which case
+    it raises with a clear reason rather than silently doing nothing.
+
+    Args:
+        reminder_id: Identifier from list_reminders / search_reminders.
+        assignee:    Who to assign it to, matched against this reminder's
+                     list only: "me", a sharee id from `sharing`, an email
+                     address, a phone number, or a name. A name that fits
+                     more than one member is refused with the list of
+                     members, so you can pass an id instead.
+    """
+    if not assignee or not assignee.strip():
+        raise ValueError("`assignee` must be a non-empty string.")
+    store = _require_store()
+    _require_assign_writes(store)
+    return ReminderResult(
+        reminder=store.assign(reminder_id, assignee.strip()), success=True
+    )
+
+
+@mcp.tool()
+def unassign_reminder(reminder_id: str) -> ReminderResult:
+    """Remove a reminder's assignment, so nobody is assigned to it.
+
+    A reminder that is not assigned is left untouched.
+
+    Args:
+        reminder_id: Identifier from list_reminders / search_reminders.
+    """
+    store = _require_store()
+    _require_assign_writes(store)
+    return ReminderResult(reminder=store.unassign(reminder_id), success=True)
 
 
 @mcp.tool()

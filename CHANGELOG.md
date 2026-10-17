@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-10-17
+
+### Added
+
+- **Who a list is shared with.** `list_reminder_lists` gives every list a `sharing` object: whether it is shared, whether you own it, the owner, and every member with name, email or phone, status (accepted / pending / removed), and which one is you. EventKit sees none of this; it is read from the Reminders store, like tags.
+- **Assignments.** `get_reminder` reports a reminder's `assignment`: the assignee, who assigned it, and when. `list_reminders` and `search_reminders` take `assigned_to` (`"me"`, a member id, an email, a phone number or a name, matched across every shared list) and `assigned` (true / false).
+- **`assign_reminder` and `unassign_reminder`**, through private ReminderKit like the tag and link writers. Assigning notifies the assignee, as in the app; assigning the person already assigned saves nothing. Verified live on a real shared list.
+- Changing who a list is shared with is deliberately not offered: it sends iCloud invitations.
+
 ## [0.3.3] — 2026-10-06
 
 ### Changed

@@ -52,6 +52,7 @@ from Foundation import (  # type: ignore
 
 from .models import (
     AlarmSpec,
+    Assignment,
     DayOfWeek,
     DeleteResult,
     Frequency,
@@ -72,6 +73,8 @@ from .tagstore import RemindersTagStore, TagStoreError
 from .tagwriter import RemindersTagWriter, TagWriteError, TagWriteUnavailable
 from .linkstore import RemindersLinkStore, LinkStoreError
 from .linkwriter import RemindersLinkWriter, LinkWriteError, parse_link
+from .sharestore import RemindersShareStore, ShareStoreError
+from .assignwriter import RemindersAssignWriter
 from .permissions import (
     PermissionDeniedError,
     authorization_status_label,
@@ -448,6 +451,10 @@ class RemindersStore:
         # ReminderKit. See linkstore.py and linkwriter.py.
         self._links = RemindersLinkStore()
         self._link_writer = RemindersLinkWriter()
+        # List sharing and assignments: also invisible to EventKit, also
+        # read from the store. See sharestore.py.
+        self._sharing = RemindersShareStore()
+        self._assign_writer = RemindersAssignWriter()
 
         self._ensure_access()
         self._refresh_lists()
@@ -516,7 +523,26 @@ class RemindersStore:
 
     def list_lists(self) -> list[ReminderList]:
         self._refresh_lists()
-        return [_calendar_to_model(c) for c in self._lists_by_id.values()]
+        return self._with_sharing(
+            [_calendar_to_model(c) for c in self._lists_by_id.values()]
+        )
+
+    def _with_sharing(self, lists: list[ReminderList]) -> list[ReminderList]:
+        """Fill in each list's sharing from the store, in one read.
+
+        A store that cannot be read leaves `sharing` None with the reason
+        set, never an empty sharee list that would read as "not shared".
+        """
+        try:
+            by_id = self._sharing.sharing_by_list()
+        except ShareStoreError as exc:
+            logger.warning("List sharing unavailable: %s", exc)
+            for lst in lists:
+                lst.sharing_unavailable_reason = str(exc)
+            return lists
+        for lst in lists:
+            lst.sharing = by_id.get(lst.id.upper())
+        return lists
 
     def _get_list(self, list_id: str) -> Any:
         cal = self._lists_by_id.get(list_id)
@@ -631,7 +657,9 @@ class RemindersStore:
             raise RuntimeError(f"Could not create list: {_nserror_str(err)}")
 
         self._refresh_lists()
-        return ListResult(list=_calendar_to_model(cal), success=True)
+        return ListResult(
+            list=self._with_sharing([_calendar_to_model(cal)])[0], success=True
+        )
 
     def update_list(
         self,
@@ -653,7 +681,9 @@ class RemindersStore:
         if not ok:
             raise RuntimeError(f"Could not update list: {_nserror_str(err)}")
         self._refresh_lists()
-        return ListResult(list=_calendar_to_model(cal), success=True)
+        return ListResult(
+            list=self._with_sharing([_calendar_to_model(cal)])[0], success=True
+        )
 
     def delete_list(self, list_id: str) -> ListResult:
         cal = self._get_list(list_id)
@@ -844,6 +874,7 @@ class RemindersStore:
 
         tags, tags_reason = self._real_tags_for(summary.id)
         link, link_reason = self._link_for(summary.id)
+        assignment, assignment_reason = self._assignment_for(summary.id)
 
         return ReminderDetail(
             **summary.model_dump(),
@@ -860,6 +891,8 @@ class RemindersStore:
             text_hashtags=text_hashtags,
             link=link,
             link_unavailable_reason=link_reason,
+            assignment=assignment,
+            assignment_unavailable_reason=assignment_reason,
             creation_date=_ns_date_to_datetime(r.creationDate()),
             modification_date=_ns_date_to_datetime(r.lastModifiedDate()),
         )
@@ -969,6 +1002,87 @@ class RemindersStore:
         self._link_writer.clear_link(reminder_id)
         return self._detail_after_link_write(reminder_id, None)
 
+    # Assignments ------------------------------------------------------
+
+    def _assignment_for(
+        self, reminder_id: str
+    ) -> tuple[Optional[Assignment], Optional[str]]:
+        """Read one reminder's assignment.
+
+        Returns (assignment, None) on success — None when it is not
+        assigned — or (None, reason) when the store is unreadable.
+        """
+        try:
+            return self._sharing.assignment_for_reminder(reminder_id), None
+        except ShareStoreError as exc:
+            logger.warning("Assignments unavailable: %s", exc)
+            return None, str(exc)
+
+    def assign_writes_unavailable_reason(self) -> Optional[str]:
+        """Why assigning would fail, or None when it can be tried."""
+        return self._assign_writer.unavailable_reason()
+
+    def _detail_after_assignment_write(
+        self, reminder_id: str, assignment: Optional[Assignment]
+    ) -> ReminderDetail:
+        """Rebuild a reminder's detail after ReminderKit changed its assignee.
+
+        `assignment` reflects the writer's own read-back. The store file is
+        consulted only for the date, and only when it already agrees.
+        """
+        self._refresh_eventkit()
+        r = self._lookup_reminder(reminder_id)
+        if r is None:
+            raise ValueError(f"Reminder not found: {reminder_id}")
+        detail = self._to_detail(r)
+        stored = detail.assignment
+        if (
+            assignment is not None and stored is not None
+            and stored.assignee.id == assignment.assignee.id
+        ):
+            assignment = stored
+        detail.assignment = assignment
+        detail.assignment_unavailable_reason = None
+        return detail
+
+    def assign(self, reminder_id: str, assignee: str) -> ReminderDetail:
+        """Assign a reminder on a shared list to one of the list's members.
+
+        `assignee` is "me", a sharee id, an email, a phone number or a name,
+        resolved against this reminder's list only.
+        """
+        self._refresh_eventkit()
+        r = self._lookup_reminder(reminder_id)
+        if r is None:
+            raise ValueError(f"Reminder not found: {reminder_id}")
+        cal = r.calendar()
+        if cal is None:
+            raise ValueError(f"Reminder {reminder_id} is not in a list.")
+        list_id = str(cal.calendarIdentifier())
+        try:
+            target = self._sharing.resolve_sharee(list_id, assignee)
+            me = self._sharing.me_on_list(list_id)
+        except ShareStoreError as exc:
+            raise RuntimeError(f"Cannot read this list's members: {exc}") from exc
+        if target.status == "removed":
+            raise ValueError(
+                f"{target.name or target.id} is no longer on this list."
+            )
+        if me is None:
+            raise RuntimeError(
+                "Could not tell which member of this list is you, so the "
+                "assignment would have no sender. Nothing was changed."
+            )
+        self._assign_writer.assign(reminder_id, target.id, me.id)
+        return self._detail_after_assignment_write(
+            reminder_id, Assignment(assignee=target, assigned_by=me)
+        )
+
+    def unassign(self, reminder_id: str) -> ReminderDetail:
+        """Remove a reminder's assignment. No-op when it has none."""
+        self._assign_writer.unassign(reminder_id)
+        return self._detail_after_assignment_write(reminder_id, None)
+
     def add_tags(self, reminder_id: str, tags: list[str]) -> ReminderDetail:
         """Add real tags to a reminder. Already-present tags are skipped."""
         result = self._tag_writer.add_tags(reminder_id, tags)
@@ -1045,6 +1159,8 @@ class RemindersStore:
         text: Optional[str] = None,
         tags: Optional[list[str]] = None,
         match_all_tags: bool = False,
+        assigned_to: Optional[str] = None,
+        assigned: Optional[bool] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[ReminderSummary]]:
@@ -1065,6 +1181,25 @@ class RemindersStore:
                 ) from exc
             if not tag_ids:
                 return 0, []
+        # Same rule for assignments: an unreadable store must fail the
+        # call, not return every reminder as though it were unassigned.
+        assigned_ids: Optional[set[str]] = None
+        wanted_assigned: Optional[bool] = assigned
+        if assigned_to is not None and assigned_to.strip():
+            if assigned is False:
+                raise ValueError(
+                    "`assigned_to` and `assigned=false` contradict each other."
+                )
+            wanted_assigned = True
+        if wanted_assigned is not None:
+            try:
+                assigned_ids = self._sharing.reminders_assigned(
+                    assigned_to.strip() if assigned_to and assigned_to.strip() else None
+                )
+            except ShareStoreError as exc:
+                raise RuntimeError(f"Cannot filter by assignment: {exc}") from exc
+            if wanted_assigned and not assigned_ids:
+                return 0, []
         self._refresh_eventkit()
         lists = self._resolve_lists(list_ids)
         pred = self._build_predicate(lists, completed, due_before, due_after)
@@ -1076,6 +1211,12 @@ class RemindersStore:
             rows = [
                 r for r in rows
                 if str(r.calendarItemIdentifier()).upper() in tag_ids
+            ]
+        if assigned_ids is not None:
+            rows = [
+                r for r in rows
+                if (str(r.calendarItemIdentifier()).upper() in assigned_ids)
+                == wanted_assigned
             ]
         # Stable sort: incomplete first, then by due date (None last), then title.
         def sort_key(r: Any) -> tuple[int, float, str]:
@@ -1102,6 +1243,8 @@ class RemindersStore:
         due_after: Optional[datetime] = None,
         tags: Optional[list[str]] = None,
         match_all_tags: bool = False,
+        assigned_to: Optional[str] = None,
+        assigned: Optional[bool] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[ReminderSummary]]:
@@ -1114,6 +1257,8 @@ class RemindersStore:
             text=query,
             tags=tags,
             match_all_tags=match_all_tags,
+            assigned_to=assigned_to,
+            assigned=assigned,
             limit=limit,
             offset=offset,
         )

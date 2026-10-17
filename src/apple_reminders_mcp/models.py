@@ -9,6 +9,46 @@ from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
+# Sharing and assignments
+# ---------------------------------------------------------------------------
+
+# "accepted" = on the list; "pending" = invited, has not joined yet;
+# "removed" = left or was removed; "unknown" = a status code not yet seen.
+ShareeStatus = Literal["accepted", "pending", "removed", "unknown"]
+
+
+class Sharee(BaseModel):
+    """One person on a shared list, including the owner and you.
+
+    `id` is the CloudKit share-participant id, which is what an assignment
+    points at. It is per list: the same person has a different id on each
+    list they share. See sharestore.py.
+    """
+    id: str
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    status: ShareeStatus = "unknown"
+    is_owner: bool = False
+    is_me: bool = False
+
+
+class ListSharing(BaseModel):
+    """Who a list is shared with. Invisible to EventKit; read from the store."""
+    is_shared: bool = False
+    owned_by_me: bool = True
+    owner: Optional[Sharee] = None
+    sharees: list[Sharee] = []                # everyone on the list, owner first
+
+
+class Assignment(BaseModel):
+    """Who a reminder on a shared list is assigned to, and by whom."""
+    assignee: Sharee
+    assigned_by: Optional[Sharee] = None      # None when Apple nullified the originator
+    assigned_date: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
 # Reminder lists (EKCalendar of type Reminder)
 # ---------------------------------------------------------------------------
 
@@ -19,6 +59,12 @@ class ReminderList(BaseModel):
     source_name: str                          # account name (e.g. "iCloud", "Local")
     source_type: str                          # "local" | "calDAV" | "exchange" | "subscribed" | "birthday" | "mobileMe"
     allows_modification: bool = True
+    # Same convention as ReminderDetail.tags: None with
+    # `sharing_unavailable_reason` set means the store could not be read;
+    # None with no reason means the list is not in the Reminders store at
+    # all (e.g. a CalDAV account's list), so it has no iCloud sharing.
+    sharing: Optional[ListSharing] = None
+    sharing_unavailable_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +181,11 @@ class ReminderDetail(ReminderSummary):
     # read; None with no reason means the reminder simply has no link.
     link: Optional[LinkedContent] = None
     link_unavailable_reason: Optional[str] = None
+    # Assignment on a shared list. None with `assignment_unavailable_reason`
+    # set means the store could not be read; None with no reason means the
+    # reminder is not assigned to anyone.
+    assignment: Optional[Assignment] = None
+    assignment_unavailable_reason: Optional[str] = None
     creation_date: Optional[datetime] = None
     modification_date: Optional[datetime] = None
 
